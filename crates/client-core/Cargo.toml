@@ -1,0 +1,48 @@
+[package]
+name = "elo-client-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+elo-protocol = { path = "../protocol" }
+elo-session = { path = "../session" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+flate2 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+async-trait = "0.1.83"
+# 2FA (TOTP, RFC 6238)
+hmac = "0.13.0"
+sha1 = "0.11.0"
+data-encoding = "2.11.1"
+# Text clipboard sync
+arboard = "3.7.0"
+# H.264 video codec (built from source)
+openh264 = "0.9.10"
+
+[target.'cfg(windows)'.dependencies]
+# System audio loopback capture + playback (WASAPI)
+cpal = "0.18.2"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58.0"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_LibraryLoader",
+]
+
+[dev-dependencies]
+tokio = { workspace = true }
+elo-relay = { path = "../relay" }

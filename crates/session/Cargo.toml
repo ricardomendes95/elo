@@ -1,0 +1,13 @@
+[package]
+name = "elo-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+snow = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

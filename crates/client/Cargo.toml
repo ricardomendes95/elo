@@ -1,0 +1,20 @@
+[package]
+name = "elo-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "elo-client"
+path = "src/main.rs"
+
+[dependencies]
+elo-protocol = { path = "../protocol" }
+elo-session = { path = "../session" }
+elo-client-core = { path = "../client-core" }
+elo-relay = { path = "../relay" }
+elo-p2p = { path = "../p2p" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

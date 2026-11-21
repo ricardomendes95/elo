@@ -1,0 +1,22 @@
+[package]
+name = "elo-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "elo_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "elo-relay"
+path = "src/main.rs"
+
+[dependencies]
+elo-protocol = { path = "../protocol" }
+serde = { workspace = true }
+bincode = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
