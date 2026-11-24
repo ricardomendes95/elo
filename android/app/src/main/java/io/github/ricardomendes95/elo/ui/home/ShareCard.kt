@@ -40,15 +40,16 @@ import androidx.compose.ui.unit.sp
 import io.github.ricardomendes95.elo.data.Prefs
 import io.github.ricardomendes95.elo.host.HostService
 import io.github.ricardomendes95.elo.host.HostState
+import io.github.ricardomendes95.elo.ui.CopyIconButton
 import io.github.ricardomendes95.elo.ui.EloCard
+import io.github.ricardomendes95.elo.ui.Feedback
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import io.github.ricardomendes95.elo.ui.PasswordField
 import io.github.ricardomendes95.elo.ui.theme.EloTheme
-
-private fun copy(ctx: Context, label: String, text: String) {
-    val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-    cm.setPrimaryClip(ClipData.newPlainText(label, text))
-    Toast.makeText(ctx, "Copiado", Toast.LENGTH_SHORT).show()
-}
 
 /** Cartão "Compartilhar esta tela": liga/desliga o host (MediaProjection + serviço). */
 @Composable
@@ -64,13 +65,29 @@ fun ShareCard() {
     val password by Prefs.hostPassword.collectAsState()
     val lanIp = remember(running) { HostState.lanIp() }
 
+    // Ligando/desligando: Switch desabilitado + progresso até o estado real mudar (ou 15 s).
+    var busy by remember { mutableStateOf(false) }
+    LaunchedEffect(running, error) { busy = false }
+    LaunchedEffect(busy) { if (busy) { delay(15_000); busy = false } }
+    var ending by remember { mutableStateOf(false) }
+    LaunchedEffect(peer) { ending = false }
+
     val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val data = r.data
         if (r.resultCode == Activity.RESULT_OK && data != null) {
             HostState.setError(null)
-            HostService.start(ctx, r.resultCode, data)
+            try {
+                busy = true
+                HostService.start(ctx, r.resultCode, data)
+                Feedback.show("Ligando o compartilhamento…")
+            } catch (e: Exception) {
+                busy = false
+                HostState.setError("Não foi possível ligar o compartilhamento.")
+                Feedback.error("Elo", "Não foi possível ligar o compartilhamento.", e)
+            }
         } else {
             HostState.setError("Permissão de captura de tela negada.")
+            Feedback.error("Elo", "Permissão de captura de tela negada.")
         }
     }
 
@@ -83,14 +100,24 @@ fun ShareCard() {
                     color = if (running) c.ok else c.muted, fontSize = 12.sp,
                 )
             }
+            if (busy) CircularProgressIndicator(Modifier.size(20.dp).padding(end = 0.dp), strokeWidth = 2.dp, color = c.accent)
+            Spacer(Modifier.size(8.dp))
             Switch(
                 checked = running,
+                enabled = !busy,
                 onCheckedChange = { on ->
-                    if (on) {
-                        val mpm = ctx.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                        consent.launch(mpm.createScreenCaptureIntent())
-                    } else {
-                        HostService.stop(ctx)
+                    try {
+                        if (on) {
+                            val mpm = ctx.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                            consent.launch(mpm.createScreenCaptureIntent())
+                        } else {
+                            busy = true
+                            HostService.stop(ctx)
+                            Feedback.show("Compartilhamento desligado")
+                        }
+                    } catch (e: Exception) {
+                        busy = false
+                        Feedback.error("Elo", "Não foi possível alterar o compartilhamento.", e)
                     }
                 },
                 colors = SwitchDefaults.colors(checkedTrackColor = c.accent, checkedThumbColor = c.onAccent),
@@ -114,19 +141,27 @@ fun ShareCard() {
         } else {
             if (status.isNotBlank()) Text(status, fontSize = 14.sp)
             Spacer(Modifier.size(8.dp))
-            InfoLine("Endereço Elo (P2P)", address?.let { if (it.length > 30) it.take(14) + "…" + it.takeLast(14) else it } ?: "iniciando…") {
-                address?.let { copy(ctx, "Endereço Elo", it) }
+            InfoLine("Endereço Elo (P2P)", address?.let { if (it.length > 30) it.take(14) + "…" + it.takeLast(14) else it } ?: "iniciando…", "Endereço Elo", "Endereço copiado") {
+                address
             }
-            if (lanIp != null) InfoLine("Rede local", "$lanIp:9000") { copy(ctx, "IP", lanIp) }
+            if (lanIp != null) InfoLine("Rede local", "$lanIp:9000", "IP", "IP copiado") { lanIp }
             Text(
                 if (password.isBlank()) "Acesso: com a sua aprovação." else "Acesso: com a senha definida.",
                 color = c.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp),
             )
             if (peer != null) {
                 OutlinedButton(
-                    onClick = { HostState.endSession() }, shape = RoundedCornerShape(12.dp),
+                    enabled = !ending,
+                    onClick = {
+                        ending = true
+                        HostState.endSession()
+                        Feedback.show("Encerrando a sessão…")
+                    }, shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.padding(top = 10.dp),
-                ) { Text("Encerrar sessão com $peer") }
+                ) {
+                    if (ending) { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp); Spacer(Modifier.size(8.dp)) }
+                    Text("Encerrar sessão com $peer")
+                }
             }
         }
 
@@ -142,7 +177,13 @@ fun ShareCard() {
                 color = c.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp),
             )
             OutlinedButton(
-                onClick = { ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) },
+                onClick = {
+                    try {
+                        ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    } catch (e: Exception) {
+                        Feedback.error("Elo", "Não foi possível abrir as configurações de acessibilidade.", e)
+                    }
+                },
                 shape = RoundedCornerShape(12.dp), modifier = Modifier.padding(top = 8.dp),
             ) { Text("Abrir configurações de acessibilidade") }
         } else {
@@ -152,14 +193,14 @@ fun ShareCard() {
 }
 
 @Composable
-private fun InfoLine(label: String, value: String, onCopy: () -> Unit) {
+private fun InfoLine(label: String, value: String, clipLabel: String, okMessage: String, text: () -> String?) {
     val c = EloTheme.colors
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         Column(Modifier.weight(1f)) {
             Text(label, color = c.muted, fontSize = 12.sp)
             Text(value, fontSize = 14.sp, maxLines = 1)
         }
-        IconButton(onClick = onCopy) { Icon(Icons.Filled.ContentCopy, "Copiar $label", tint = c.accent) }
+        CopyIconButton(text(), clipLabel, okMessage, "Copiar $label")
     }
 }
 
@@ -180,7 +221,7 @@ fun HostApprovalDialog() {
                 )
             }
         },
-        confirmButton = { TextButton(onClick = { HostState.respondApproval(true) }) { Text("Aceitar") } },
-        dismissButton = { TextButton(onClick = { HostState.respondApproval(false) }) { Text("Recusar") } },
+        confirmButton = { TextButton(onClick = { HostState.respondApproval(true); Feedback.show("Acesso aceito") }) { Text("Aceitar") } },
+        dismissButton = { TextButton(onClick = { HostState.respondApproval(false); Feedback.show("Acesso recusado") }) { Text("Recusar") } },
     )
 }

@@ -71,6 +71,16 @@ object EloCore {
      */
     fun newDiscovery(): Discovery = Discovery()
 
+    /** Anuncia este aparelho na LAN (bloqueante na 1ª vez: lê/cria a chave). */
+    fun announcePresence(name: String) {
+        runCatching { core().announcePresence(name) }
+    }
+
+    /** Para o anúncio (o host, se estiver rodando, mantém o dele). */
+    fun stopPresence() {
+        runCatching { core().stopPresence() }
+    }
+
     /** Presença de um favorito/endereço (até ~8 s). */
     suspend fun isOnline(target: String, lan: Boolean, directory: String): Boolean =
         withContext(Dispatchers.IO) { runCatching { core().isOnline(target, lan, directory) }.getOrDefault(false) }

@@ -40,7 +40,11 @@ pub fn install() -> Result<()> {
     // Let the interactive user's GUI update the machine config (Users = S-1-5-32-545).
     run_quiet("icacls", &[&dir.to_string_lossy(), "/grant", "*S-1-5-32-545:(OI)(CI)M"]);
     // Allow services to generate Ctrl+Alt+Del via SendSAS (3 = services and
-    // ease-of-access apps).
+    // ease-of-access apps). Remember whether the policy existed, so the
+    // uninstaller only removes what we created.
+    if !reg_value_exists(SAS_POLICY_KEY, "SoftwareSASGeneration") {
+        run_quiet("reg", &["add", ELO_REG_KEY, "/v", "SasPolicyCreated", "/t", "REG_DWORD", "/d", "1", "/f"]);
+    }
     run_quiet(
         "reg",
         &[
@@ -65,7 +69,13 @@ pub fn install() -> Result<()> {
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
-        executable_path: std::env::current_exe()?,
+        // Prefer the copy in Program Files, so the service never points at a
+        // file in Downloads that the user may delete or replace.
+        executable_path: if crate::install::is_installed() {
+            crate::install::installed_exe()
+        } else {
+            std::env::current_exe()?
+        },
         launch_arguments: vec![OsString::from("--service")],
         dependencies: vec![],
         account_name: None, // LocalSystem
@@ -80,14 +90,55 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
-/// Stop and delete the service (must run elevated).
+/// Registry key of the system policies (holds `SoftwareSASGeneration`).
+const SAS_POLICY_KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+/// Elo's own machine key (install markers).
+pub const ELO_REG_KEY: &str = r"HKLM\SOFTWARE\Elo";
+
+fn reg_value_exists(key: &str, value: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("reg")
+        .args(["query", key, "/v", value])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Executable the installed service runs (from the SCM), if any.
+pub fn service_exe() -> Option<std::path::PathBuf> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG).ok()?;
+    Some(service.query_config().ok()?.executable_path)
+}
+
+/// Stop and delete the service (must run elevated), then undo the
+/// Ctrl+Alt+Del policy if we created it.
 pub fn uninstall() -> Result<()> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service =
-        manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::DELETE)?;
-    let _ = service.stop();
-    service.delete()?;
-    Ok(())
+    use windows_service::service::ServiceState;
+    let result = (|| -> Result<()> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let service = manager.open_service(
+            SERVICE_NAME,
+            ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
+        )?;
+        let _ = service.stop();
+        // Wait (up to 15 s) for it to stop, so its exe is released.
+        for _ in 0..30 {
+            match service.query_status() {
+                Ok(st) if st.current_state != ServiceState::Stopped => std::thread::sleep(Duration::from_millis(500)),
+                _ => break,
+            }
+        }
+        service.delete()?;
+        Ok(())
+    })();
+    if reg_value_exists(ELO_REG_KEY, "SasPolicyCreated") {
+        run_quiet("reg", &["delete", SAS_POLICY_KEY, "/v", "SoftwareSASGeneration", "/f"]);
+        run_quiet("reg", &["delete", ELO_REG_KEY, "/v", "SasPolicyCreated", "/f"]);
+    }
+    result
 }
 
 /// Re-launch this exe elevated (UAC) with `arg` (e.g. `--install-service`).
@@ -101,8 +152,8 @@ pub fn elevate(arg: &str) -> Result<()> {
     let file = HSTRING::from(exe.as_os_str());
     let params = HSTRING::from(arg);
     // SAFETY: ShellExecuteW with owned, null-terminated HSTRING buffers kept
-    // alive for the call. We ignore the returned instance handle.
-    unsafe {
+    // alive for the call.
+    let inst = unsafe {
         ShellExecuteW(
             HWND::default(),
             &verb,
@@ -110,7 +161,11 @@ pub fn elevate(arg: &str) -> Result<()> {
             &params,
             windows::core::PCWSTR::null(),
             SW_SHOWNORMAL,
-        );
+        )
+    };
+    // ShellExecute devolve um valor > 32 em caso de sucesso; UAC negado = erro.
+    if inst.0 as isize <= 32 {
+        anyhow::bail!("o Windows não confirmou a elevação (UAC cancelado?)");
     }
     Ok(())
 }

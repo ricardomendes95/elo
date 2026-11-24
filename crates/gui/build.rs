@@ -50,7 +50,7 @@ fn set_version_info(res: &mut winresource::WindowsResource, product: &str, descr
 #[cfg(windows)]
 const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="Elo.Remote" version="0.1.0.0" processorArchitecture="amd64"/>
+  <assemblyIdentity type="win32" name="Elo.Remote" version="0.3.5.0" processorArchitecture="amd64"/>
   <description>Elo - acesso remoto</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>

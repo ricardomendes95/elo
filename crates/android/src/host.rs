@@ -64,7 +64,6 @@ pub struct Host {
     shared: Arc<Shared>,
     address: String,
     stop_tx: watch::Sender<bool>,
-    announcer: Mutex<Option<elo_client_core::discovery::Announcer>>,
 }
 
 struct AndroidCapture {
@@ -157,7 +156,7 @@ impl Elo {
         let keypair = load_or_create_keypair(&self.data_dir);
         let name: String = name.trim().chars().take(64).collect();
         let name = if name.is_empty() { "Android".to_string() } else { name };
-        let announcer = elo_client_core::discovery::start(name, short_id(&keypair), DIRECT_PORT);
+        presence_announce(name, short_id(&keypair), true);
         let download_dir = self.data_dir.join("Recebidos");
         let _ = std::fs::create_dir_all(&download_dir);
 
@@ -172,7 +171,6 @@ impl Elo {
             shared: shared.clone(),
             address: node.id(),
             stop_tx,
-            announcer: Mutex::new(Some(announcer)),
         });
         tracing::info!("host Android iniciado");
         self.rt.spawn(host_loop(node, keypair, password, download_dir, shared, stop_rx));
@@ -342,9 +340,73 @@ impl Host {
         }
     }
 
-    /// Para o host: encerra a sessão, fecha a porta e some da descoberta da LAN.
+    /// Para o host: encerra a sessão e fecha a porta. Na descoberta da LAN o
+    /// aparelho segue visível, mas como "sem compartilhar a tela".
     pub fn stop(&self) {
-        self.announcer.lock().unwrap().take();
+        presence_set_hosting(false);
         let _ = self.stop_tx.send(true);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Presença na LAN: um único anúncio por processo, com "aceita conexões" ligado
+// só enquanto o host roda. Assim o PC vê o celular sempre que o app está
+// aberto, e a lista diz se o compartilhamento está ligado.
+// ---------------------------------------------------------------------------
+
+struct Presence {
+    name: String,
+    accepting: Arc<std::sync::atomic::AtomicBool>,
+    _announcer: elo_client_core::discovery::Announcer,
+}
+
+static PRESENCE: Mutex<Option<Presence>> = Mutex::new(None);
+
+/// Garante o anúncio com este nome; `hosting` define se aceita conexões.
+fn presence_announce(name: String, short_id: String, hosting: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut slot = PRESENCE.lock().unwrap();
+    match slot.as_ref() {
+        Some(p) if p.name == name => p.accepting.store(hosting, Ordering::Relaxed),
+        _ => {
+            // Troca de nome (ou primeiro anúncio): recria. O anterior para no drop.
+            *slot = None;
+            let accepting = Arc::new(AtomicBool::new(hosting));
+            let announcer =
+                elo_client_core::discovery::start_with_flag(name.clone(), short_id, DIRECT_PORT, accepting.clone());
+            *slot = Some(Presence { name, accepting, _announcer: announcer });
+        }
+    }
+}
+
+fn presence_set_hosting(hosting: bool) {
+    if let Some(p) = PRESENCE.lock().unwrap().as_ref() {
+        p.accepting.store(hosting, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn presence_hosting() -> bool {
+    PRESENCE.lock().unwrap().as_ref().map(|p| p.accepting.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false)
+}
+
+#[uniffi::export]
+impl Elo {
+    /// Anuncia este aparelho na LAN enquanto o app está aberto (para o PC vê-lo),
+    /// mesmo sem compartilhar a tela. Idempotente.
+    pub fn announce_presence(&self, name: String) {
+        let keypair = load_or_create_keypair(&self.data_dir);
+        let name: String = name.trim().chars().take(64).collect();
+        let name = if name.is_empty() { "Android".to_string() } else { name };
+        let hosting = presence_hosting();
+        presence_announce(name, short_id(&keypair), hosting);
+    }
+
+    /// Para o anúncio, a menos que o host esteja rodando (aí ele continua).
+    pub fn stop_presence(&self) {
+        let mut slot = PRESENCE.lock().unwrap();
+        let hosting = slot.as_ref().map(|p| p.accepting.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false);
+        if !hosting {
+            *slot = None;
+        }
     }
 }

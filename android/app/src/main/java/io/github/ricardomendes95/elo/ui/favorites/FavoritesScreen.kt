@@ -58,6 +58,7 @@ import io.github.ricardomendes95.elo.ui.ConnectDialogs
 import io.github.ricardomendes95.elo.ui.Connector
 import io.github.ricardomendes95.elo.ui.EloCard
 import io.github.ricardomendes95.elo.ui.EloField
+import io.github.ricardomendes95.elo.ui.Feedback
 import io.github.ricardomendes95.elo.ui.PasswordField
 import io.github.ricardomendes95.elo.ui.theme.EloTheme
 import kotlinx.coroutines.coroutineScope
@@ -113,7 +114,7 @@ fun FavoritesScreen() {
                             f, presence[key(f)],
                             onConnect = { Connector.start(f.address, f.lan, f.password, f.name) },
                             onEdit = { editing = f },
-                            onRemove = { Prefs.setFavorites(Prefs.favorites.value - f) },
+                            onRemove = { Prefs.setFavorites(Prefs.favorites.value - f); Feedback.show("Favorito removido") },
                         )
                     }
                 }
@@ -129,11 +130,13 @@ fun FavoritesScreen() {
     if (creating) {
         FavoriteDialog(null, onDismiss = { creating = false }) {
             Prefs.setFavorites(Prefs.favorites.value + it); creating = false
+            Feedback.show("Favorito salvo")
         }
     }
     editing?.let { old ->
         FavoriteDialog(old, onDismiss = { editing = null }) { nw ->
             Prefs.setFavorites(Prefs.favorites.value.map { if (it == old) nw else it }); editing = null
+            Feedback.show("Favorito atualizado")
         }
     }
     ConnectDialogs(full = true)

@@ -191,10 +191,14 @@ impl Config {
     }
 
     pub fn save_to(&self, dir: &Path) {
-        let _ = std::fs::create_dir_all(dir);
-        if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::write(dir.join("config.json"), json);
-        }
+        let _ = self.try_save_to(dir);
+    }
+
+    /// Como `save_to`, mas devolve o motivo da falha para a UI mostrar.
+    pub fn try_save_to(&self, dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("config.json"), json).map_err(|e| e.to_string())
     }
 
     pub fn is_trusted(&self, fingerprint: &str) -> bool {

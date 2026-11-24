@@ -75,6 +75,9 @@ import io.github.ricardomendes95.elo.ui.ConnectDialogs
 import io.github.ricardomendes95.elo.ui.Connector
 import io.github.ricardomendes95.elo.ui.EloCard
 import io.github.ricardomendes95.elo.ui.EloField
+import io.github.ricardomendes95.elo.ui.Feedback
+import io.github.ricardomendes95.elo.ui.copyToClipboard
+import androidx.compose.material.icons.filled.Check
 import io.github.ricardomendes95.elo.ui.PasswordField
 import io.github.ricardomendes95.elo.ui.PrimaryButton
 import io.github.ricardomendes95.elo.ui.theme.EloLogo
@@ -210,14 +213,10 @@ fun HomeScreen() {
                             }
                         },
                         onRename = { renaming = r },
-                        onRemove = { Prefs.setRecents(Prefs.recents.value - r) },
+                        onRemove = { Prefs.setRecents(Prefs.recents.value - r); Feedback.show("Removido dos recentes") },
                         onFavorite = {
                             val added = Prefs.addFavorite(r.name, r.address, r.lan, r.password)
-                            Toast.makeText(
-                                ctx,
-                                if (added) "Adicionado aos favoritos." else "Já está nos favoritos.",
-                                Toast.LENGTH_SHORT,
-                            ).show()
+                            Feedback.show(if (added) "Adicionado aos favoritos" else "Já está nos favoritos")
                         },
                     )
                 }
@@ -242,6 +241,7 @@ fun HomeScreen() {
                     onClick = {
                         Prefs.setRecents(Prefs.recents.value.map { if (it == r) it.copy(name = name.trim()) else it })
                         renaming = null
+                        Feedback.show("Nome salvo")
                     },
                 ) { Text("Salvar") }
             },
@@ -261,6 +261,7 @@ fun HomeScreen() {
                     onClick = {
                         Prefs.setFavorites(Prefs.favorites.value + Favorite(name.trim(), address.trim(), lan, password))
                         saveDialog = false
+                        Feedback.show("Favorito salvo")
                     },
                 ) { Text("Salvar") }
             },
@@ -333,7 +334,12 @@ private fun NetworkDevicesSection(enabled: Boolean, onConnect: (DiscoveredDevice
             runCatching { acquire() }
         }
         failed = runCatching { discovery.start() }.isFailure
+        // Anuncia este aparelho para o PC vê-lo na lista dele (mesmo sem compartilhar a tela).
+        val name = Prefs.deviceName.value.ifBlank { EloCore.defaultDeviceName() }
+        val presence = scope.launch(kotlinx.coroutines.Dispatchers.IO) { EloCore.announcePresence(name) }
         onDispose {
+            presence.cancel()
+            EloCore.stopPresence()
             runCatching { discovery.stop() }
             runCatching { discovery.close() }
             runCatching { if (lock.isHeld) lock.release() }
@@ -358,9 +364,11 @@ private fun NetworkDevicesSection(enabled: Boolean, onConnect: (DiscoveredDevice
                     scanning = true
                     devices.clear()
                     runCatching { discovery.stop() }
-                    failed = runCatching { discovery.start() }.isFailure
+                    failed = runCatching { discovery.start() }.onFailure { android.util.Log.w("Elo", "Descoberta falhou", it) }.isFailure
                     delay(2000)
                     scanning = false
+                    if (failed) Feedback.error("Elo", "Não foi possível buscar dispositivos na rede.")
+                    else Feedback.show(if (devices.isEmpty()) "Nenhum dispositivo encontrado" else "Lista atualizada")
                 }
             },
         ) {
@@ -384,14 +392,17 @@ private fun NetworkDevicesSection(enabled: Boolean, onConnect: (DiscoveredDevice
             devices.forEachIndexed { i, d ->
                 if (i > 0) Spacer(Modifier.size(2.dp))
                 Row(
-                    Modifier.fillMaxWidth().clickable(enabled = enabled) { onConnect(d) }.padding(vertical = 10.dp),
+                    Modifier.fillMaxWidth().clickable(enabled = enabled && d.accepting) { onConnect(d) }.padding(vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    Icon(Icons.Filled.Wifi, null, tint = c.accent2)
+                    Icon(Icons.Filled.Wifi, null, tint = if (d.accepting) c.accent2 else c.muted)
                     Column(Modifier.weight(1f)) {
                         Text(d.name.ifBlank { d.ip }, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                        Text("${d.ip}:${d.port}", color = c.muted, fontSize = 12.sp, maxLines = 1)
+                        Text(
+                            if (d.accepting) "${d.ip}:${d.port}" else "${d.ip} · compartilhamento de tela desligado",
+                            color = c.muted, fontSize = 12.sp, maxLines = 1,
+                        )
                     }
                 }
             }
@@ -409,8 +420,13 @@ private fun DeviceCard() {
     var editName by remember { mutableStateOf(false) }
     var id by remember { mutableStateOf<String?>(null) }
     var err by remember { mutableStateOf<String?>(null) }
+    var copied by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     LaunchedEffect(Unit) {
-        EloCore.deviceId().onSuccess { id = it }.onFailure { err = it.message }
+        EloCore.deviceId().onSuccess { id = it }.onFailure {
+            android.util.Log.w("Elo", "Falha ao obter o ID P2P", it)
+            err = it.message ?: "Não foi possível obter o endereço P2P."
+        }
     }
     EloCard {
         Text("Este dispositivo", fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
@@ -439,16 +455,23 @@ private fun DeviceCard() {
             OutlinedButton(
                 enabled = id != null, shape = RoundedCornerShape(12.dp),
                 onClick = {
-                    val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(ClipData.newPlainText("Endereço Elo", id))
-                    Toast.makeText(ctx, "Endereço copiado", Toast.LENGTH_SHORT).show()
+                    if (copyToClipboard(ctx, "Endereço Elo", id ?: return@OutlinedButton, "Endereço copiado")) {
+                        scope.launch { copied = true; delay(1500); copied = false }
+                    }
                 },
-            ) { Icon(Icons.Filled.ContentCopy, null, Modifier.size(18.dp)); Spacer(Modifier.size(6.dp)); Text("Copiar") }
+            ) {
+                Icon(if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy, null, Modifier.size(18.dp))
+                Spacer(Modifier.size(6.dp)); Text(if (copied) "Copiado" else "Copiar")
+            }
             OutlinedButton(
                 enabled = id != null, shape = RoundedCornerShape(12.dp),
                 onClick = {
-                    val i = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, id)
-                    ctx.startActivity(Intent.createChooser(i, "Compartilhar endereço").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    try {
+                        val i = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, id)
+                        ctx.startActivity(Intent.createChooser(i, "Compartilhar endereço").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    } catch (e: Exception) {
+                        Feedback.error("Elo", "Não foi possível abrir o compartilhamento.", e)
+                    }
                 },
             ) { Icon(Icons.Filled.Share, null, Modifier.size(18.dp)); Spacer(Modifier.size(6.dp)); Text("Compartilhar") }
         }
@@ -472,6 +495,7 @@ private fun DeviceCard() {
                 TextButton(onClick = {
                     Prefs.setDeviceName(name.trim().takeIf { it != defaultName } ?: "")
                     editName = false
+                    Feedback.show("Nome salvo")
                 }) { Text("Salvar") }
             },
             dismissButton = { TextButton(onClick = { editName = false }) { Text("Cancelar") } },

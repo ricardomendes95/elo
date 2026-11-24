@@ -155,8 +155,25 @@ fn find_main_window() -> isize {
 /// vazado de propósito para permanecer vivo por todo o processo.
 #[cfg(windows)]
 fn acquire_single_instance() -> bool {
+    // `--restarted` (ex.: "Reiniciar como admin"): a instância anterior ainda
+    // está saindo; espera ela soltar o mutex em vez de desistir na hora.
+    let wait = std::env::args().any(|a| a == "--restarted");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match try_single_instance(!wait) {
+            Some(acquired) => return acquired,
+            None if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(250)),
+            None => return false,
+        }
+    }
+}
+
+/// `Some(true)` = primeira instância; `Some(false)` = já existe (janela dela
+/// trazida para frente); `None` = já existe e `focus_existing` é falso.
+#[cfg(windows)]
+fn try_single_instance(focus_existing: bool) -> Option<bool> {
     use windows::core::w;
-    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowW, SetForegroundWindow, ShowWindow, SW_SHOW,
@@ -165,6 +182,13 @@ fn acquire_single_instance() -> bool {
         let handle = CreateMutexW(None, true, w!("Local\\EloApp_Singleton"));
         let already = GetLastError() == ERROR_ALREADY_EXISTS;
         if already {
+            // Solta o nosso handle: segurá-lo manteria o mutex vivo para sempre.
+            if let Ok(h) = handle {
+                let _ = CloseHandle(h);
+            }
+            if !focus_existing {
+                return None;
+            }
             // Já há uma instância: traz a janela dela para frente e desiste.
             if let Ok(h) = FindWindowW(None, w!("Elo")) {
                 if !h.0.is_null() {
@@ -172,13 +196,12 @@ fn acquire_single_instance() -> bool {
                     let _ = SetForegroundWindow(h);
                 }
             }
-            return false;
+            return Some(false);
         }
-        // Primeira instância: mantém o mutex vivo pelo resto do processo.
-        if let Ok(h) = handle {
-            std::mem::forget(h);
-        }
-        true
+        // Primeira instância: mantém o mutex vivo pelo resto do processo
+        // (o handle simplesmente não é fechado).
+        let _ = handle;
+        Some(true)
     }
 }
 
@@ -198,14 +221,15 @@ pub fn random_code() -> String {
 }
 
 /// Open a folder in the OS file manager.
-pub fn open_folder(path: &std::path::Path) {
-    let _ = std::fs::create_dir_all(path);
+pub fn open_folder(path: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|e| format!("não consegui criar a pasta: {e}"))?;
     #[cfg(windows)]
-    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    let r = std::process::Command::new("explorer").arg(path).spawn();
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(path).spawn();
+    let r = std::process::Command::new("open").arg(path).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
-    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    let r = std::process::Command::new("xdg-open").arg(path).spawn();
+    r.map(|_| ()).map_err(|e| format!("não consegui abrir o Explorador de Arquivos: {e}"))
 }
 
 /// Best-effort local LAN IP (no packets are actually sent).
@@ -326,6 +350,12 @@ pub struct Enroll {
     pub error: Option<String>,
 }
 
+/// Resultado de uma ação em segundo plano (ver `App::run_bg`).
+struct BgDone {
+    key: &'static str,
+    result: Result<String, String>,
+}
+
 pub struct App {
     pub rt: Runtime,
     pub pal: Palette,
@@ -351,7 +381,14 @@ pub struct App {
     pub approvals: VecDeque<PendingApproval>,
     pub host_session: Option<HostSessionUi>,
     pub pointer: Option<PointerState>,
-    pub toasts: Vec<(String, Instant)>,
+    /// (texto, quando surgiu, é erro?)
+    pub toasts: Vec<(String, Instant, bool)>,
+    /// Última vez que cada botão "Copiar" foi clicado (chave -> instante).
+    pub copied: HashMap<String, Instant>,
+    /// Ações em segundo plano em andamento (chave -> início).
+    pub busy: HashMap<&'static str, Instant>,
+    bg_tx: smpsc::Sender<BgDone>,
+    bg_rx: smpsc::Receiver<BgDone>,
 
     // Navigation.
     pub view: View,
@@ -379,6 +416,10 @@ pub struct App {
     // (kept alive while this machine hosts).
     pub discovery: Option<DiscoveryHandle>,
     pub announcer: Option<Announcer>,
+    /// Busca na rede em andamento (botão Atualizar) até este instante.
+    pub discovery_scan_until: Option<std::time::Instant>,
+    /// Por que a descoberta na LAN não está disponível, se não estiver.
+    pub discovery_error: Option<String>,
 
     // Live link to the connected controller (host side), for sending files to
     // it. The host loop fills it with `Some` while a controller is connected.
@@ -432,6 +473,7 @@ impl App {
             ("iniciando…".to_string(), config.short_id.clone())
         };
         let (ui_tx, ui_rx) = smpsc::channel();
+        let (bg_tx, bg_rx) = smpsc::channel();
         let light = config.theme == "light";
         // Ícone na bandeja: se falhar, o app segue sem ele. O contexto do egui
         // é passado para a thread da bandeja acordar o `update()` (via
@@ -468,6 +510,10 @@ impl App {
             host_session: None,
             pointer: None,
             toasts: Vec::new(),
+            copied: HashMap::new(),
+            busy: HashMap::new(),
+            bg_tx,
+            bg_rx,
             view: View::Home,
             settings_tab: SettingsTab::General,
             remote_addr: String::new(),
@@ -482,6 +528,8 @@ impl App {
             rename: None,
             rename_buf: String::new(),
             discovery: None,
+            discovery_scan_until: None,
+            discovery_error: None,
             announcer: None,
             host_link: Arc::new(Mutex::new(None)),
             enroll: None,
@@ -543,7 +591,71 @@ impl App {
     }
 
     pub fn toast(&mut self, text: impl Into<String>) {
-        self.toasts.push((text.into(), Instant::now()));
+        self.toasts.push((text.into(), Instant::now(), false));
+    }
+
+    /// Toast vermelho de erro; também vai para o log.
+    pub fn toast_error(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        tracing::warn!(erro = %text, "falha mostrada ao usuário");
+        self.toasts.push((text, Instant::now(), true));
+    }
+
+    /// Toast de sucesso ou de erro conforme o resultado.
+    pub fn toast_result(&mut self, r: Result<String, String>) {
+        match r {
+            Ok(m) if m.is_empty() => {}
+            Ok(m) => self.toast(m),
+            Err(e) => self.toast_error(e),
+        }
+    }
+
+    /// A ação em segundo plano `key` está rodando?
+    pub fn is_busy(&self, key: &str) -> bool {
+        self.busy.contains_key(key)
+    }
+
+    /// Roda `work` numa thread (nunca bloqueia o frame). Enquanto roda, `key`
+    /// fica em `busy`; o resultado vira toast (sucesso ou erro; texto vazio =
+    /// sem toast). Ignora se `key` já está rodando.
+    pub fn run_bg(&mut self, ctx: &egui::Context, key: &'static str, work: impl FnOnce() -> Result<String, String> + Send + 'static) {
+        if self.busy.contains_key(key) {
+            return;
+        }
+        self.busy.insert(key, Instant::now());
+        let tx = self.bg_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = work();
+            let _ = tx.send(BgDone { key, result: r });
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_bg(&mut self) {
+        while let Ok(done) = self.bg_rx.try_recv() {
+            self.busy.remove(done.key);
+            self.toast_result(done.result);
+        }
+    }
+
+    /// Botão "Copiar": copia `text`, mostra "Copiado ✔" por ~1,5 s e dá um toast.
+    pub fn copy_button(&mut self, ui: &mut egui::Ui, key: &str, label: &str, text: &str, toast: &str, small: bool) -> egui::Response {
+        const FOR: Duration = Duration::from_millis(1500);
+        let since = self.copied.get(key).map(|t| t.elapsed());
+        let done = since.is_some_and(|e| e < FOR);
+        if let Some(e) = since.filter(|e| *e < FOR) {
+            ui.ctx().request_repaint_after(FOR - e + Duration::from_millis(20));
+        }
+        let shown = if done { "Copiado ✔" } else { label };
+        let resp = if small { ui.small_button(shown) } else { ui.button(shown) };
+        if resp.clicked() {
+            ui.output_mut(|o| o.copied_text = text.to_string());
+            self.copied.insert(key.to_string(), Instant::now());
+            self.toast(toast);
+            ui.ctx().request_repaint_after(FOR + Duration::from_millis(20));
+        }
+        resp
     }
 
     /// Persist a new configuration (user dir, service dir in service mode) and
@@ -552,17 +664,19 @@ impl App {
         let autostart_changed = cfg.autostart != self.config.autostart;
         let otp_turned_on = cfg.otp && !self.config.otp;
         self.config = cfg;
-        self.config.save();
+        if let Err(e) = self.config.try_save_to(&config::config_dir()) {
+            self.toast_error(format!("Não consegui gravar as configurações: {e}"));
+        }
         if self.service_mode {
             self.config.save_to(&config::service_dir());
             if Config::load_from(&config::service_dir()).allow_control != self.config.allow_control {
-                self.toast("Não consegui gravar a configuração do serviço (permissão). Reinstale o serviço.");
+                self.toast_error("Não consegui gravar a configuração do serviço (permissão). Reinstale o serviço.");
             }
         }
         *self.live.lock().unwrap() = self.config.clone();
         if autostart_changed {
             if let Err(e) = config::set_autostart(self.config.autostart) {
-                self.toast(format!("Iniciar com o sistema: {e}"));
+                self.toast_error(format!("Não consegui alterar o início com o sistema: {e}"));
             }
         }
         if otp_turned_on {
@@ -583,7 +697,10 @@ impl App {
             let _g = self.rt.enter();
             match elo_client_core::discovery::listen() {
                 Ok(h) => self.discovery = Some(h),
-                Err(e) => tracing::warn!(error = %e, "descoberta na LAN indisponível"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "descoberta na LAN indisponível");
+                    self.discovery_error = Some(e.to_string());
+                }
             }
             self.announcer = Some(elo_client_core::discovery::start(disp, self.my_short_id.clone(), DIRECT_PORT));
         }
@@ -709,6 +826,7 @@ impl App {
         let keypair = match elo_session::generate_keypair() {
             Ok(k) => k,
             Err(e) => {
+                self.toast_error(format!("Não foi possível iniciar a conexão: {e}"));
                 self.conn = Conn::Failed(e.to_string());
                 return;
             }
@@ -732,6 +850,7 @@ impl App {
         } else {
             let node = self.node.lock().unwrap().clone();
             let Some(node) = node else {
+                self.toast_error("A conexão P2P ainda está iniciando — tente de novo em instantes.");
                 self.conn = Conn::Failed("P2P ainda iniciando — tente em instantes.".into());
                 return;
             };
@@ -823,7 +942,7 @@ impl App {
     pub fn save_favorite(&mut self) {
         let addr = self.remote_addr.trim().to_string();
         if addr.is_empty() {
-            self.toast("Informe o endereço antes de salvar.");
+            self.toast_error("Informe o endereço antes de salvar.");
             return;
         }
         let name = if self.fav_name.trim().is_empty() { addr.chars().take(18).collect() } else { self.fav_name.trim().to_string() };
@@ -884,6 +1003,7 @@ impl App {
         self.conn = match result {
             Ok((handle, events, label)) => {
                 tracing::info!(target = %label, "sessão de controle iniciada");
+                self.toast(format!("Conectado a {label}."));
                 self.record_recent(&label, self.mode_lan, self.remote_password.clone());
                 Conn::Active(Box::new(Session::new(handle, events, label)))
             }
@@ -894,7 +1014,9 @@ impl App {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "falha ao conectar");
-                Conn::Failed(friendly_error(&e))
+                let msg = friendly_error(&e);
+                self.toast_error(format!("Não foi possível conectar: {msg}"));
+                Conn::Failed(msg)
             }
         };
     }
@@ -933,9 +1055,15 @@ impl App {
                     cfg.trusted.push(TrustedDevice { name: req.name.clone(), fingerprint: req.fp.clone(), added: today() });
                     self.draft.trusted = cfg.trusted.clone();
                     self.save_config(cfg);
+                    self.toast(format!("{} agora é um dispositivo confiável.", req.name));
                 }
             }
             tracing::info!(peer = %req.name, allow, trust = req.trust, "pedido de conexão respondido");
+            if allow {
+                self.toast(format!("Acesso permitido a {}.", req.name));
+            } else {
+                self.toast(format!("Acesso negado a {}.", req.name));
+            }
             if let Some(r) = req.reply.take() {
                 let _ = r.send(allow);
             }
@@ -968,11 +1096,18 @@ impl App {
         });
         match action {
             Some(true) => {
-                self.need_2fa = false;
                 let code = self.twofa_code.trim().to_string();
-                self.start_connect(Some(code));
+                if code.is_empty() {
+                    self.toast_error("Digite o código de 6 dígitos do app autenticador.");
+                } else {
+                    self.need_2fa = false;
+                    self.start_connect(Some(code));
+                }
             }
-            Some(false) => self.need_2fa = false,
+            Some(false) => {
+                self.need_2fa = false;
+                self.toast("Conexão cancelada.");
+            }
             None => {}
         }
     }
@@ -991,6 +1126,7 @@ impl App {
         let pal = self.pal;
         let mut add = false;
         let mut dismiss = false;
+        let mut copy_cmd = false;
         modal(ctx, &pal, "defender", |ui| {
             ui.set_max_width(460.0);
             ui.label(egui::RichText::new("Windows Defender pode bloquear o Elo").size(18.0).strong().color(pal.text));
@@ -1014,9 +1150,11 @@ impl App {
                 egui::Frame::none().fill(pal.surface).stroke(egui::Stroke::new(1.0_f32, pal.border)).rounding(6.0).inner_margin(egui::Margin::same(8.0)).show(ui, |ui| {
                     ui.add(egui::TextEdit::multiline(&mut cmd).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(2));
                 });
-                if ui.small_button("Copiar comando").clicked() {
-                    ui.output_mut(|o| o.copied_text = defender::manual_command());
+                let copied_now = self.copied.get("defender-cmd").is_some_and(|t| t.elapsed() < Duration::from_millis(1500));
+                if copied_now {
+                    ui.ctx().request_repaint_after(Duration::from_millis(200));
                 }
+                copy_cmd = ui.small_button(if copied_now { "Copiado ✔" } else { "Copiar comando" }).on_hover_text("Copia o comando para colar no PowerShell de administrador").clicked();
             }
 
             ui.add_space(12.0);
@@ -1033,10 +1171,15 @@ impl App {
             });
         });
 
+        if copy_cmd {
+            ctx.output_mut(|o| o.copied_text = defender::manual_command());
+            self.copied.insert("defender-cmd".into(), Instant::now());
+            self.toast("Comando copiado.");
+        }
         if add {
             match defender::request_exclusion() {
                 Ok(()) => {
-                    self.toasts.push(("Se você confirmou no UAC, a exceção foi adicionada.".into(), Instant::now()));
+                    self.toast("Se você confirmou no UAC, a exceção foi adicionada.");
                     // Re-verifica depois de alguns segundos; o painel some se der certo.
                     *self.defender_excluded.lock().unwrap() = None;
                     let cell = self.defender_excluded.clone();
@@ -1049,7 +1192,7 @@ impl App {
                     self.config.defender_hidden = true;
                     self.config.save();
                 }
-                Err(e) => self.toasts.push((format!("Não foi possível adicionar a exceção: {e}"), Instant::now())),
+                Err(e) => self.toast_error(format!("Não foi possível adicionar a exceção: {e}")),
             }
         }
         if dismiss {
@@ -1057,12 +1200,13 @@ impl App {
             // "Agora não" / ignorar: não aparece mais nas próximas execuções.
             self.config.defender_hidden = true;
             self.config.save();
+            self.toast("Aviso dispensado. Ele não aparecerá de novo.");
         }
     }
 
     /// Floating notifications, bottom-right.
     fn toasts_ui(&mut self, ctx: &egui::Context) {
-        self.toasts.retain(|(_, t)| t.elapsed() < Duration::from_secs(6));
+        self.toasts.retain(|(_, t, err)| t.elapsed() < Duration::from_secs(if *err { 9 } else { 5 }));
         if self.toasts.is_empty() {
             return;
         }
@@ -1071,16 +1215,16 @@ impl App {
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::RIGHT_BOTTOM, [-18.0, -18.0])
             .show(ctx, |ui| {
-                for (text, _) in &self.toasts {
+                for (text, _, err) in &self.toasts {
                     egui::Frame::none()
-                        .fill(pal.surface)
-                        .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                        .fill(if *err { { let (a, b, t) = (pal.surface, pal.danger, 0.15_f32); let m = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t) as u8; Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b())) } } else { pal.surface })
+                        .stroke(egui::Stroke::new(1.0_f32, if *err { pal.danger } else { pal.border }))
                         .rounding(10.0)
                         .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                         .shadow(egui::epaint::Shadow { offset: egui::vec2(0.0, 4.0), blur: 16.0, spread: 0.0, color: Color32::from_black_alpha(90) })
                         .show(ui, |ui| {
                             ui.set_max_width(360.0);
-                            ui.label(egui::RichText::new(text).color(pal.text));
+                            ui.label(egui::RichText::new(text).color(if *err { pal.danger } else { pal.text }));
                         });
                     ui.add_space(6.0);
                 }
@@ -1211,6 +1355,7 @@ impl eframe::App for App {
         }
         self.pump_events();
         self.poll_connect();
+        self.poll_bg();
         self.drain_tray(ctx);
         self.handle_close(ctx);
 
@@ -1226,7 +1371,7 @@ impl eframe::App for App {
         self.defender_modal(ctx);
         self.toasts_ui(ctx);
 
-        if matches!(self.conn, Conn::Active(_) | Conn::Connecting(_)) || self.pointer.is_some() {
+        if matches!(self.conn, Conn::Active(_) | Conn::Connecting(_)) || self.pointer.is_some() || !self.busy.is_empty() {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(Duration::from_millis(250));

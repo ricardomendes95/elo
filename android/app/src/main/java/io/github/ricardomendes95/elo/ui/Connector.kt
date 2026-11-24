@@ -1,5 +1,6 @@
 package io.github.ricardomendes95.elo.ui
 
+import android.util.Log
 import io.github.ricardomendes95.elo.core.ConnectRequest
 import io.github.ricardomendes95.elo.core.ConnectResult
 import io.github.ricardomendes95.elo.core.EloCore
@@ -72,7 +73,7 @@ object Connector {
                     _state.value = ConnState.Idle
                 }
                 ConnectResult.NeedTwoFa -> _state.value = ConnState.NeedTwoFa
-                is ConnectResult.Error -> { pending = null; _state.value = ConnState.Error(result.message) }
+                is ConnectResult.Error -> { Log.w("Elo", "Falha ao conectar: ${result.message}"); pending = null; _state.value = ConnState.Error(result.message) }
             }
         }
     }

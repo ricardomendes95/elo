@@ -10,6 +10,7 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -59,6 +60,7 @@ fun EloApp() {
 
     Scaffold(
         containerColor = c.bg,
+        snackbarHost = { SnackbarHost(Feedback.host) },
         bottomBar = {
             if (route != ROUTE_SESSION) {
                 NavigationBar(containerColor = c.bar, contentColor = c.text) {

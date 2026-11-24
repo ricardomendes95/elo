@@ -7,7 +7,9 @@ use egui::{Color32, Rect, Sense, Vec2};
 
 use crate::config;
 use crate::hostrun::DIRECT_PORT;
-use crate::theme::{avatar, card, nav_item, primary_button, setting_row, settings_group, settings_section, toggle_row, toggle_switch};
+#[cfg(windows)]
+use crate::theme::action_button;
+use crate::theme::{avatar, primary_button_if, card, nav_item, primary_button, setting_row, settings_group, settings_section, toggle_row, toggle_switch};
 use crate::{logging, open_folder, short_fp, App, Enroll, SettingsTab};
 
 pub fn page_settings(app: &mut App, ui: &mut egui::Ui) {
@@ -52,16 +54,23 @@ fn is_dirty(app: &App) -> bool {
 
 fn save_row(app: &mut App, ui: &mut egui::Ui) {
     let pal = app.pal;
+    let dirty = is_dirty(app);
     ui.horizontal(|ui| {
-        if primary_button(ui, &pal, "  Salvar  ").clicked() {
+        if primary_button_if(ui, &pal, dirty, "  Salvar  ", "Não há alterações para salvar.").on_hover_text("Grava as alterações").clicked() {
             let cfg = app.draft.clone();
             app.save_config(cfg);
             app.toast("Configurações salvas.");
         }
-        if ui.add(egui::Button::new("Desfazer").min_size(egui::vec2(0.0, 34.0))).clicked() {
+        if ui
+            .add_enabled(dirty, egui::Button::new("Desfazer").min_size(egui::vec2(0.0, 34.0)))
+            .on_hover_text("Volta ao que está salvo")
+            .on_disabled_hover_text("Não há alterações para desfazer.")
+            .clicked()
+        {
             app.draft = app.config.clone();
+            app.toast("Alterações descartadas.");
         }
-        if is_dirty(app) {
+        if dirty {
             ui.label(egui::RichText::new("alterações não salvas").small().color(pal.warn));
         }
     });
@@ -151,6 +160,7 @@ fn twofa(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     let mut finish: Option<bool> = None;
+    let mut copy_key: Option<String> = None;
     if let Some(en) = &mut app.enroll {
         ui.add_space(8.0);
         egui::Frame::none().fill(pal.elevated).rounding(10.0).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
@@ -161,15 +171,18 @@ fn twofa(app: &mut App, ui: &mut egui::Ui) {
                     ui.label(egui::RichText::new("1. Escaneie o QR no app autenticador (Google/Microsoft Authenticator, Authy…).").color(pal.text));
                     ui.label(egui::RichText::new("Ou digite a chave:").small().color(pal.muted));
                     let mut key = elo_client_core::totp::secret_to_base32(&en.secret);
-                    ui.add(egui::TextEdit::singleline(&mut key).font(egui::TextStyle::Monospace).desired_width(330.0));
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut key).font(egui::TextStyle::Monospace).desired_width(330.0));
+                        copy_key = Some(key.clone());
+                    });
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("2. Digite o código de 6 dígitos que o app mostra:").color(pal.text));
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut en.code).desired_width(110.0).hint_text("000000"));
-                        if primary_button(ui, &pal, "Ativar").clicked() {
+                        if primary_button(ui, &pal, "Ativar").on_hover_text("Confere o código e liga o 2FA").clicked() {
                             finish = Some(true);
                         }
-                        if ui.button("Cancelar").clicked() {
+                        if ui.button("Cancelar").on_hover_text("Desiste de ligar o 2FA").clicked() {
                             finish = Some(false);
                         }
                     });
@@ -181,6 +194,12 @@ fn twofa(app: &mut App, ui: &mut egui::Ui) {
         });
     } else if app.config.twofa {
         ui.label(egui::RichText::new("2FA ativo.").small().color(pal.accent_text));
+    }
+    if let Some(k) = copy_key {
+        // O botão fica logo abaixo do campo, fora do empréstimo de `app.enroll`.
+        ui.horizontal(|ui| {
+            app.copy_button(ui, "totp-key", "Copiar chave", &k, "Chave 2FA copiada", true).on_hover_text("Copia a chave para digitar no app autenticador");
+        });
     }
     match finish {
         Some(true) => {
@@ -197,9 +216,13 @@ fn twofa(app: &mut App, ui: &mut egui::Ui) {
                 app.toast("2FA ativado.");
             } else {
                 en.error = Some("Código incorreto — confira o relógio do celular e tente de novo.".into());
+                app.toast_error("Código 2FA incorreto. Confira o relógio do celular e tente de novo.");
             }
         }
-        Some(false) => app.enroll = None,
+        Some(false) => {
+            app.enroll = None;
+            app.toast("Ativação do 2FA cancelada.");
+        }
         None => {}
     }
 }
@@ -245,7 +268,7 @@ fn security(app: &mut App, ui: &mut egui::Ui) {
                         ui.label(egui::RichText::new(format!("{} · pareado em {}", short_fp(&d.fingerprint), d.added)).small().monospace().color(pal.muted));
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Remover").clicked() {
+                        if ui.button("Remover").on_hover_text("Este dispositivo volta a precisar de senha ou aprovação").clicked() {
                             remove = Some(i);
                         }
                     });
@@ -256,6 +279,7 @@ fn security(app: &mut App, ui: &mut egui::Ui) {
                 cfg.trusted.remove(i);
                 app.draft.trusted = cfg.trusted.clone();
                 app.save_config(cfg);
+                app.toast("Dispositivo removido.");
             }
         }
 
@@ -281,9 +305,17 @@ fn security(app: &mut App, ui: &mut egui::Ui) {
             setting_row(ui, &pal, "Rodar como administrador (UAC)",
                 "Permite controlar janelas elevadas (Gerenciador de Tarefas, instaladores). Reinicia o Elo. Com o serviço instalado isso já vale.",
                 190.0, |ui| {
-                if ui.button("Reiniciar como admin").clicked() {
-                    let _ = crate::service::elevate("");
-                    std::process::exit(0);
+                let restarting = app.is_busy("restart_admin");
+                if action_button(ui, &pal, restarting, false, "Reiniciar como admin", "Reiniciando…")
+                    .on_hover_text("Reabre o Elo com permissão de administrador (pede confirmação do UAC)")
+                    .clicked()
+                {
+                    // Só fecha esta janela se o Windows aceitou (UAC confirmado).
+                    let ctx = ui.ctx().clone();
+                    app.run_bg(&ctx, "restart_admin", || match crate::service::elevate("--restarted") {
+                        Ok(()) => std::process::exit(0),
+                        Err(e) => Err(format!("Não reiniciou como administrador: {e}")),
+                    });
                 }
             });
         }
@@ -327,17 +359,30 @@ fn service_tab(app: &mut App, ui: &mut egui::Ui) {
             });
             ui.add_space(8.0);
             if app_installed {
-                if ui.button("Desinstalar o Elo").clicked() {
-                    match crate::install::elevate_uninstall() {
-                        Ok(()) => app.toast("Desinstalando… confirme no UAC."),
-                        Err(e) => app.toast(format!("Não foi possível iniciar a desinstalação: {e}")),
+                ui.horizontal(|ui| {
+                    let busy = app.is_busy("uninstall");
+                    if action_button(ui, &pal, busy, false, "Desinstalar o Elo", "Desinstalando…")
+                        .on_hover_text("Remove o Elo, o serviço e os dados deste computador (pede confirmação do UAC)")
+                        .clicked()
+                    {
+                        let ctx = ui.ctx().clone();
+                        app.run_bg(&ctx, "uninstall", || {
+                            crate::install::elevate_uninstall()
+                                .map(|()| "Desinstalando… confirme no UAC.".to_string())
+                                .map_err(|e| format!("Não foi possível iniciar a desinstalação: {e}"))
+                        });
                     }
-                }
-            } else if primary_button(ui, &pal, "Instalar o Elo").clicked() {
-                match crate::install::elevate_install() {
-                    Ok(()) => app.toast("Instalando… confirme no UAC. A instalação roda em segundo plano."),
-                    Err(e) => app.toast(format!("Não foi possível iniciar a instalação: {e}")),
-                }
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    let busy = app.is_busy("install");
+                    if action_button(ui, &pal, busy, true, "Instalar o Elo", "Instalando…")
+                        .on_hover_text("Instala o Elo no Windows (pede confirmação do UAC)")
+                        .clicked()
+                    {
+                        crate::ui_home::run_install(app, ui.ctx());
+                    }
+                });
             }
         });
         let installed = crate::service::is_installed();
@@ -350,23 +395,33 @@ fn service_tab(app: &mut App, ui: &mut egui::Ui) {
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if !installed {
-                    if primary_button(ui, &pal, "Instalar serviço").clicked() {
-                        if crate::service::elevate("--install-service").is_ok() {
-                            app.toast("Confirme no Windows (UAC). Depois reabra o Elo.");
+                if installed {
+                    if ui.button("Logs do serviço").on_hover_text("Abre a pasta de logs do serviço no Explorador de Arquivos").clicked() {
+                        match open_folder(&config::service_dir().join("logs")) {
+                            Ok(()) => app.toast("Abrindo a pasta de logs do serviço…"),
+                            Err(e) => app.toast_error(e),
                         }
                     }
+                } else if app_installed {
+                    // Instalação antiga, sem serviço: reinstalar junta tudo.
+                    let busy = app.is_busy("repair");
+                    if action_button(ui, &pal, busy, true, "Reparar instalação", "Reparando…")
+                        .on_hover_text("Reinstala o Elo junto com o serviço (pede confirmação do UAC)")
+                        .clicked()
+                    {
+                        let ctx = ui.ctx().clone();
+                        app.run_bg(&ctx, "repair", || {
+                            crate::install::elevate_install()
+                                .map(|()| "Confirme no Windows (UAC). O Elo será reinstalado com o serviço.".to_string())
+                                .map_err(|e| format!("Não foi possível iniciar a instalação: {e}"))
+                        });
+                    }
                 } else {
-                    if ui.button("Desinstalar serviço").clicked() && crate::service::elevate("--uninstall-service").is_ok() {
-                        app.toast("Confirme no Windows (UAC). Depois reabra o Elo.");
-                    }
-                    if ui.button("Logs do serviço").clicked() {
-                        open_folder(&config::service_dir().join("logs"));
-                    }
+                    ui.label(egui::RichText::new("O serviço é instalado junto com o Elo (botão Instalar acima).").color(pal.muted));
                 }
             });
             ui.add_space(6.0);
-            ui.label(egui::RichText::new("Ao instalar, a identidade e a senha deste computador são copiadas para o serviço — salve a senha fixa antes.").small().color(pal.muted));
+            ui.label(egui::RichText::new("Ao instalar, a identidade e a senha deste computador são copiadas para o serviço — salve a senha fixa antes. Desinstalar o Elo remove o serviço junto.").small().color(pal.muted));
         });
     }
     #[cfg(not(windows))]
@@ -383,15 +438,21 @@ fn logs(app: &mut App, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Registro de atividades").strong().color(pal.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Limpar visualização").clicked() {
+                if ui.button("Limpar visualização").on_hover_text("Esvazia só a lista abaixo; os arquivos de log continuam na pasta").clicked() {
                     logging::clear_view();
+                    app.toast("Visualização dos logs limpa.");
                 }
-                if ui.button("Copiar").clicked() {
-                    let text = logging::recent().join("\n");
-                    ui.output_mut(|o| o.copied_text = text);
+                let text = logging::recent().join("\n");
+                if text.is_empty() {
+                    if ui.add_enabled(false, egui::Button::new("Copiar")).on_disabled_hover_text("Não há registros para copiar.").clicked() {}
+                } else {
+                    app.copy_button(ui, "logs", "Copiar", &text, "Logs copiados", false).on_hover_text("Copia o registro de atividades para a área de transferência");
                 }
-                if ui.button("Abrir pasta").clicked() {
-                    open_folder(&logging::log_dir());
+                if ui.button("Abrir pasta").on_hover_text("Abre a pasta dos arquivos de log").clicked() {
+                    match open_folder(&logging::log_dir()) {
+                        Ok(()) => app.toast("Abrindo a pasta de logs…"),
+                        Err(e) => app.toast_error(e),
+                    }
                 }
             });
         });
@@ -424,11 +485,19 @@ fn about(app: &mut App, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new(format!("Impressão digital deste computador: {}", short_fp(&fp))).monospace().small().color(pal.muted));
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            if ui.button("Abrir pasta de dados").clicked() {
-                open_folder(&config::config_dir());
+            app.copy_button(ui, "fp", "Copiar impressão digital", &fp, "Impressão digital copiada", false)
+                .on_hover_text("Copia a impressão digital completa deste computador");
+            if ui.button("Abrir pasta de dados").on_hover_text("Abre a pasta com a configuração do Elo").clicked() {
+                match open_folder(&config::config_dir()) {
+                    Ok(()) => app.toast("Abrindo a pasta de dados…"),
+                    Err(e) => app.toast_error(e),
+                }
             }
-            if ui.button("Abrir pasta de logs").clicked() {
-                open_folder(&logging::log_dir());
+            if ui.button("Abrir pasta de logs").on_hover_text("Abre a pasta dos arquivos de log").clicked() {
+                match open_folder(&logging::log_dir()) {
+                    Ok(()) => app.toast("Abrindo a pasta de logs…"),
+                    Err(e) => app.toast_error(e),
+                }
             }
         });
     });

@@ -1651,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "elo-android"
-version = "0.1.0"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1668,7 +1668,7 @@ dependencies = [
 
 [[package]]
 name = "elo-client"
-version = "0.1.0"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "elo-client-core",
@@ -1684,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "elo-client-core"
-version = "0.1.0"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1710,7 +1710,7 @@ dependencies = [
 
 [[package]]
 name = "elo-gui"
-version = "0.1.0"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1735,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "elo-p2p"
-version = "0.1.0"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "iroh",
@@ -1744,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "elo-protocol"
-version = "0.1.0"
+version = "0.3.5"
 dependencies = [
  "bincode",
  "serde",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "elo-relay"
-version = "0.1.0"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "elo-session"
-version = "0.1.0"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "snow",

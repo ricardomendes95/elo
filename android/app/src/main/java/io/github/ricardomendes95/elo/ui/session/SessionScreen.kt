@@ -162,6 +162,8 @@ fun SessionScreen(active: ActiveSession, onExit: () -> Unit) {
     var infoOpen by remember { mutableStateOf(false) }
     var confirmExit by remember { mutableStateOf(false) }
     var monitorMenu by remember { mutableStateOf(false) }
+    var sendingFile by remember { mutableStateOf(false) }
+    var sendingClip by remember { mutableStateOf(false) }
     var actionsMenu by remember { mutableStateOf(false) }
     var seenChat by remember { mutableIntStateOf(0) }
     var fps by remember { mutableIntStateOf(0) }
@@ -190,6 +192,9 @@ fun SessionScreen(active: ActiveSession, onExit: () -> Unit) {
                 runCatching {
                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     cm.setPrimaryClip(ClipData.newPlainText("Elo", text))
+                }.onFailure {
+                    android.util.Log.w("Elo", "Falha ao gravar a área de transferência", it)
+                    Toast.makeText(context, "Não foi possível copiar o texto recebido do computador.", Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -235,6 +240,8 @@ fun SessionScreen(active: ActiveSession, onExit: () -> Unit) {
     val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
+            sendingFile = true
+            Toast.makeText(context, "Enviando arquivo…", Toast.LENGTH_SHORT).show()
             val result = withContext(Dispatchers.IO) {
                 runCatching {
                     val cr = context.contentResolver
@@ -255,9 +262,11 @@ fun SessionScreen(active: ActiveSession, onExit: () -> Unit) {
                     name
                 }
             }
+            sendingFile = false
+            result.exceptionOrNull()?.let { android.util.Log.w("Elo", "Falha ao enviar arquivo", it) }
             Toast.makeText(
                 context,
-                result.fold({ "Enviando \"$it\" para a pasta de downloads do computador." }, { it.message ?: "Falha ao enviar." }),
+                result.fold({ "Enviando \"$it\" para a pasta de downloads do computador." }, { "Falha ao enviar o arquivo: " + (it.message ?: "erro desconhecido") }),
                 Toast.LENGTH_LONG,
             ).show()
         }
@@ -486,7 +495,16 @@ fun SessionScreen(active: ActiveSession, onExit: () -> Unit) {
                                 monitors.forEach { m ->
                                     DropdownMenuItem(
                                         text = { Text("${m.index + 1u}. ${m.name.ifBlank { "Monitor" }} — ${m.width}×${m.height}" + if (m.current) "  ✓" else "") },
-                                        onClick = { monitorMenu = false; session.selectMonitor(m.index) },
+                                        onClick = {
+                                            monitorMenu = false
+                                            try {
+                                                session.selectMonitor(m.index)
+                                                Toast.makeText(context, "Trocando para o monitor ${m.index + 1u}…", Toast.LENGTH_SHORT).show()
+                                            } catch (e: Exception) {
+                                                android.util.Log.w("Elo", "Falha ao trocar de monitor", e)
+                                                Toast.makeText(context, "Não foi possível trocar de monitor.", Toast.LENGTH_LONG).show()
+                                            }
+                                        },
                                     )
                                 }
                             }
@@ -499,8 +517,13 @@ fun SessionScreen(active: ActiveSession, onExit: () -> Unit) {
                                 text = { Text("Ctrl+Alt+Del") },
                                 onClick = {
                                     actionsMenu = false
-                                    session.sendSas()
-                                    Toast.makeText(context, "Ctrl+Alt+Del enviado (requer o serviço do Elo no Windows).", Toast.LENGTH_SHORT).show()
+                                    try {
+                                        session.sendSas()
+                                        Toast.makeText(context, "Ctrl+Alt+Del enviado (requer o serviço do Elo no Windows).", Toast.LENGTH_SHORT).show()
+                                    } catch (e: Exception) {
+                                        android.util.Log.w("Elo", "Falha ao enviar Ctrl+Alt+Del", e)
+                                        Toast.makeText(context, "Não foi possível enviar Ctrl+Alt+Del.", Toast.LENGTH_LONG).show()
+                                    }
                                 },
                             )
                             listOf(
@@ -513,7 +536,13 @@ fun SessionScreen(active: ActiveSession, onExit: () -> Unit) {
                                     text = { Text("$keys  ·  $label") },
                                     onClick = {
                                         actionsMenu = false
-                                        keyboard.combo(*vks)
+                                        try {
+                                            keyboard.combo(*vks)
+                                            Toast.makeText(context, "$keys enviado.", Toast.LENGTH_SHORT).show()
+                                        } catch (e: Exception) {
+                                            android.util.Log.w("Elo", "Falha ao enviar $keys", e)
+                                            Toast.makeText(context, "Não foi possível enviar $keys.", Toast.LENGTH_LONG).show()
+                                        }
                                     },
                                 )
                             }
@@ -523,8 +552,9 @@ fun SessionScreen(active: ActiveSession, onExit: () -> Unit) {
                         audioOn = !audioOn
                         session.setAudio(audioOn)
                         if (!audioOn) audio.release()
+                        Toast.makeText(context, if (audioOn) "Som do computador ligado." else "Som do computador desligado.", Toast.LENGTH_SHORT).show()
                     }
-                    BarButton(Icons.Filled.Upload, "Enviar área de transferência ao PC", false) {
+                    BarButton(Icons.Filled.Upload, "Enviar área de transferência ao PC", false, enabled = !sendingClip, busy = sendingClip) {
                         if (!info.clipboard) {
                             Toast.makeText(context, "O computador não liberou a área de transferência nesta sessão.", Toast.LENGTH_LONG).show()
                             return@BarButton
@@ -537,15 +567,25 @@ fun SessionScreen(active: ActiveSession, onExit: () -> Unit) {
                         if (text.isNullOrEmpty()) {
                             Toast.makeText(context, "Não há texto na área de transferência deste aparelho (copie algo e tente de novo).", Toast.LENGTH_LONG).show()
                         } else {
-                            session.sendClipboard(text)
-                            Toast.makeText(context, "Área de transferência enviada ao computador. Cole com Ctrl+V.", Toast.LENGTH_SHORT).show()
+                            scope.launch {
+                                sendingClip = true
+                                try {
+                                    withContext(Dispatchers.IO) { session.sendClipboard(text) }
+                                    Toast.makeText(context, "Área de transferência enviada ao computador. Cole com Ctrl+V.", Toast.LENGTH_SHORT).show()
+                                } catch (e: Exception) {
+                                    android.util.Log.w("Elo", "Falha ao enviar a área de transferência", e)
+                                    Toast.makeText(context, "Não foi possível enviar a área de transferência.", Toast.LENGTH_LONG).show()
+                                } finally {
+                                    sendingClip = false
+                                }
+                            }
                         }
                     }
                     val unread = chat.size - seenChat
                     BadgedBox(badge = { if (unread > 0 && !chatOpen) Badge { Text("$unread") } }) {
                         BarButton(Icons.Filled.Chat, "Chat", chatOpen) { chatOpen = true }
                     }
-                    BarButton(Icons.Filled.UploadFile, "Enviar arquivo", false, enabled = info.fileTransfer) {
+                    BarButton(Icons.Filled.UploadFile, "Enviar arquivo", false, enabled = info.fileTransfer && !sendingFile, busy = sendingFile) {
                         pickFile.launch(arrayOf("*/*"))
                     }
                     BarButton(Icons.Filled.Info, "Informações", infoOpen) { infoOpen = true }
@@ -676,6 +716,7 @@ private fun BarButton(
     selected: Boolean,
     enabled: Boolean = true,
     tint: Color = TextMain,
+    busy: Boolean = false,
     onClick: () -> Unit,
 ) {
     IconButton(onClick = onClick, enabled = enabled) {
@@ -686,7 +727,8 @@ private fun BarButton(
                 .background(if (selected) Teal.copy(alpha = 0.18f) else Color.Transparent),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(icon, contentDescription = label, tint = if (!enabled) TextMuted.copy(alpha = 0.4f) else if (selected) Teal else tint)
+            if (busy) androidx.compose.material3.CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = Teal)
+            else Icon(icon, contentDescription = label, tint = if (!enabled) TextMuted.copy(alpha = 0.4f) else if (selected) Teal else tint)
         }
     }
 }
@@ -756,6 +798,7 @@ private fun KeyChip(label: String, active: Boolean, onClick: () -> Unit) {
 
 @Composable
 private fun ChatSheet(active: ActiveSession) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
     val chat by active.chat.collectAsState()
     var input by remember { mutableStateOf("") }
     val list = rememberLazyListState()
@@ -790,7 +833,14 @@ private fun ChatSheet(active: ActiveSession) {
                 placeholder = { Text("Mensagem") },
                 singleLine = true,
             )
-            IconButton(onClick = { active.sendChat(input.trim()); input = "" }, enabled = input.isNotBlank()) {
+            IconButton(onClick = {
+                try {
+                    active.sendChat(input.trim()); input = ""
+                } catch (e: Exception) {
+                    android.util.Log.w("Elo", "Falha ao enviar mensagem", e)
+                    android.widget.Toast.makeText(ctx, "Não foi possível enviar a mensagem.", android.widget.Toast.LENGTH_LONG).show()
+                }
+            }, enabled = input.isNotBlank()) {
                 Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Enviar", tint = Teal)
             }
         }

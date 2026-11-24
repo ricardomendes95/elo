@@ -34,6 +34,7 @@ import io.github.ricardomendes95.elo.core.EloCore
 import io.github.ricardomendes95.elo.data.Prefs
 import io.github.ricardomendes95.elo.ui.EloCard
 import io.github.ricardomendes95.elo.ui.EloField
+import io.github.ricardomendes95.elo.ui.Feedback
 import io.github.ricardomendes95.elo.ui.theme.EloTheme
 
 @Composable
@@ -58,7 +59,7 @@ fun SettingsScreen() {
         Section("Geral") {
             Item("Nome deste aparelho", deviceName.ifBlank { defaultName }, onClick = { editName = true })
             HorizontalDivider(color = c.border)
-            Choice("Tema", theme, listOf("dark" to "Escuro", "light" to "Claro", "system" to "Sistema"), Prefs::setTheme)
+            Choice("Tema", theme, listOf("dark" to "Escuro", "light" to "Claro", "system" to "Sistema")) { Prefs.setTheme(it); Feedback.show("Tema alterado") }
         }
         Section("Conexão") {
             Item("Servidor de diretório", directory.ifBlank { "desligado (host:porta, para IDs curtos)" }, onClick = { editDir = true })
@@ -66,26 +67,28 @@ fun SettingsScreen() {
             Item("Porta LAN padrão", "9000 (informativa)")
         }
         Section("Sessão") {
-            Choice("Modo de toque padrão", touch, listOf("direct" to "Direto", "touchpad" to "Touchpad"), Prefs::setTouchMode)
+            Choice("Modo de toque padrão", touch, listOf("direct" to "Direto", "touchpad" to "Touchpad")) { Prefs.setTouchMode(it); Feedback.show("Modo de toque salvo") }
             HorizontalDivider(color = c.border)
-            Toggle("Som ligado ao entrar", audio, Prefs::setAudioOnStart)
+            Toggle("Som ligado ao entrar", audio) { Prefs.setAudioOnStart(it); Feedback.show(if (it) "Som ligado ao entrar" else "Som desligado ao entrar") }
             HorizontalDivider(color = c.border)
-            Toggle("Manter a tela ligada", keepOn, Prefs::setKeepScreenOn)
+            Toggle("Manter a tela ligada", keepOn) { Prefs.setKeepScreenOn(it); Feedback.show(if (it) "Tela ficará ligada" else "Tela pode apagar") }
         }
         Section("Sobre") {
             Item("Versão", "0.1.0")
             HorizontalDivider(color = c.border)
             Item("Elo", "Elo — acesso remoto P2P")
             HorizontalDivider(color = c.border)
-            Item("Arquivos recebidos", runCatching { EloCore.downloadDir().absolutePath }.getOrDefault("indisponível"))
+            Item("Arquivos recebidos", runCatching { EloCore.downloadDir().absolutePath }.onFailure { android.util.Log.w("Elo", "downloadDir falhou", it) }.getOrDefault("indisponível"))
         }
     }
 
     if (editName) TextDialog("Nome deste aparelho", deviceName.ifBlank { defaultName }, { editName = false }) {
         Prefs.setDeviceName(it.trim().takeIf { n -> n != defaultName } ?: ""); editName = false
+        Feedback.show("Nome salvo")
     }
     if (editDir) TextDialog("Servidor de diretório (host:porta)", directory, { editDir = false }) {
         Prefs.setDirectory(it); editDir = false
+        Feedback.show("Servidor de diretório salvo")
     }
 }
 

@@ -1,6 +1,7 @@
 //! The controller session view: remote screen, toolbar (monitors, Ctrl+Alt+Del,
 //! sound, fullscreen, chat, files) and input forwarding.
 
+use std::sync::mpsc as smpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -29,10 +30,19 @@ pub struct Session {
     pub next_file_id: u32,
     pub fullscreen: bool,
     pub notice: Option<(String, Instant)>,
+    /// Resultados das ações assíncronas (chave, resultado) vindos das tasks.
+    res_tx: smpsc::Sender<(&'static str, Result<String, String>)>,
+    res_rx: smpsc::Receiver<(&'static str, Result<String, String>)>,
+    /// Ações em andamento: Ctrl+Alt+Del, troca de monitor.
+    busy_sas: bool,
+    busy_monitor: bool,
+    /// Arquivos sendo enviados agora.
+    sending_files: u32,
 }
 
 impl Session {
     pub fn new(handle: ControllerHandle, events: mpsc::Receiver<ControllerEvent>, label: String) -> Self {
+        let (res_tx, res_rx) = smpsc::channel();
         Session {
             handle,
             events,
@@ -49,6 +59,11 @@ impl Session {
             next_file_id: 1,
             fullscreen: false,
             notice: None,
+            res_tx,
+            res_rx,
+            busy_sas: false,
+            busy_monitor: false,
+            sending_files: 0,
         }
     }
 }
@@ -60,6 +75,22 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
     let on_top_before = app.always_on_top;
     let mut always_on_top = on_top_before;
     let Conn::Active(session) = &mut app.conn else { return };
+
+    // ---- resultados das ações assíncronas ----
+    let mut new_toasts: Vec<(String, bool)> = Vec::new();
+    while let Ok((key, res)) = session.res_rx.try_recv() {
+        match key {
+            "sas" => session.busy_sas = false,
+            "monitor" => session.busy_monitor = false,
+            "file" => session.sending_files = session.sending_files.saturating_sub(1),
+            _ => {}
+        }
+        match res {
+            Ok(m) if m.is_empty() => {}
+            Ok(m) => new_toasts.push((m, false)),
+            Err(e) => new_toasts.push((e, true)),
+        }
+    }
 
     // ---- drain events ----
     let mut disconnected = false;
@@ -89,7 +120,7 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
             Ok(ControllerEvent::FileReceived { path }) => session.chat.push(format!("[arquivo recebido: {}]", path.display())),
             // O bridge já aplica a área de transferência sozinho; aqui só avisamos.
             Ok(ControllerEvent::Clipboard(_)) => {
-                app.toasts.push(("Área de transferência recebida do computador remoto.".to_string(), Instant::now()));
+                new_toasts.push(("Área de transferência recebida do computador remoto.".to_string(), false));
             }
             // Só chegam com `ConnectOptions::raw_media` (app Android); o desktop decodifica/toca aqui mesmo.
             Ok(ControllerEvent::FrameH264 { .. } | ControllerEvent::Audio { .. }) => {}
@@ -109,6 +140,10 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
         restore_window_level(app, ctx);
+        for (t, e) in new_toasts {
+            app.toasts.push((t, Instant::now(), e));
+        }
+        app.toast_error("A sessão foi encerrada.");
         app.conn = Conn::Failed("A sessão foi encerrada.".into());
         return;
     }
@@ -138,22 +173,37 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
                     if session.monitors.len() > 1 {
                         let current = session.monitors.iter().find(|m| m.current).map(|m| m.index).unwrap_or(0);
                         egui::ComboBox::from_id_salt("monitor")
-                            .selected_text(format!("Monitor {}", current + 1))
+                            .selected_text(if session.busy_monitor { "Trocando…".to_string() } else { format!("Monitor {}", current + 1) })
                             .show_ui(ui, |ui| {
                                 for m in &session.monitors {
                                     let label = format!("Monitor {} — {}×{}{}", m.index + 1, m.width, m.height, if m.primary { " (principal)" } else { "" });
-                                    if ui.selectable_label(m.current, label).clicked() && !m.current {
+                                    if ui.selectable_label(m.current, label).clicked() && !m.current && !session.busy_monitor {
                                         select_monitor = Some(m.index);
                                     }
                                 }
-                            });
+                            })
+                            .response
+                            .on_hover_text("Escolhe qual tela do computador remoto aparece aqui");
+                        if session.busy_monitor {
+                            ui.spinner();
+                        }
                     }
-                    if can_control && ui.button("Ctrl+Alt+Del").on_hover_text("Requer o serviço do Windows no outro computador").clicked() {
+                    if !can_control {
+                        ui.add_enabled(false, egui::Button::new("Ctrl+Alt+Del")).on_disabled_hover_text("Esta sessão é somente visualização.");
+                    } else if session.busy_sas {
+                        ui.add_enabled(false, egui::Button::new("Enviando…")).on_disabled_hover_text("Aguarde: o Ctrl+Alt+Del está sendo enviado.");
+                        ui.spinner();
+                    } else if ui.button("Ctrl+Alt+Del").on_hover_text("Requer o serviço do Windows no outro computador").clicked() {
                         sas = true;
                     }
                     let audio = session.handle.audio();
-                    if ui.button(if audio { "Som: ligado" } else { "Som: mudo" }).clicked() {
+                    if ui
+                        .button(if audio { "Som: ligado" } else { "Som: mudo" })
+                        .on_hover_text(if audio { "Clique para silenciar o som do computador remoto" } else { "Clique para ouvir o som do computador remoto" })
+                        .clicked()
+                    {
                         session.handle.set_audio(!audio);
+                        new_toasts.push((if audio { "Som silenciado." } else { "Som ligado." }.to_string(), false));
                     }
                     if ui.button("Tela cheia").on_hover_text("F11 alterna; Esc não sai (é enviado ao remoto)").clicked() {
                         session.fullscreen = true;
@@ -165,17 +215,27 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
                         .clicked()
                     {
                         always_on_top = !always_on_top;
+                        new_toasts.push((if always_on_top { "Janela mantida no topo." } else { "Janela volta ao normal." }.to_string(), false));
                     }
-                    if ui.button(if session.chat_open { "Fechar chat" } else { "Chat" }).clicked() {
+                    if ui
+                        .button(if session.chat_open { "Fechar chat" } else { "Chat" })
+                        .on_hover_text("Mostra ou esconde a conversa com o outro computador")
+                        .clicked()
+                    {
                         session.chat_open = !session.chat_open;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::danger_button(ui, &pal, "Desconectar").clicked() {
+                        if theme::danger_button(ui, &pal, "Desconectar").on_hover_text("Encerra a sessão com este computador").clicked() {
                             disconnect = true;
                         }
                     });
                 });
-                if let Some((n, t)) = &session.notice {
+                if session.sending_files > 0 {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new(format!("Enviando {} arquivo(s)…", session.sending_files)).small().color(pal.accent_text));
+                    });
+                } else if let Some((n, t)) = &session.notice {
                     if t.elapsed() < Duration::from_secs(4) {
                         ui.label(egui::RichText::new(n).small().color(pal.accent_text));
                     }
@@ -191,6 +251,10 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
         restore_window_level(app, ctx);
+        for (t, e) in new_toasts {
+            app.toasts.push((t, Instant::now(), e));
+        }
+        app.toast("Sessão encerrada.");
         app.conn = Conn::Idle;
         return;
     }
@@ -210,7 +274,13 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
                 });
                 ui.separator();
                 let resp = ui.add(egui::TextEdit::singleline(&mut session.chat_input).desired_width(f32::INFINITY).hint_text("mensagem…"));
-                let send = primary_button(ui, &pal, "Enviar").clicked() || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                let empty = session.chat_input.trim().is_empty();
+                let send = ui
+                    .add_enabled_ui(!empty, |ui| primary_button(ui, &pal, "Enviar"))
+                    .inner
+                    .on_disabled_hover_text("Digite uma mensagem para enviar.")
+                    .clicked()
+                    || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                 if send && !session.chat_input.trim().is_empty() {
                     let text = session.chat_input.trim().to_string();
                     session.chat.push(format!("você: {text}"));
@@ -244,22 +314,30 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
     let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
     for f in dropped {
         if let Some(path) = f.path {
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "arquivo".into());
-                    let id = session.next_file_id;
-                    session.next_file_id += 1;
-                    session.notice = Some((format!("Enviando {name} ({} KB)…", bytes.len() / 1024), Instant::now()));
-                    session.chat.push(format!("[enviado: {name}]"));
-                    let h = session.handle.clone();
-                    app.rt.spawn(async move {
-                        if let Err(e) = h.send_file(id, &name, &bytes).await {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "arquivo".into());
+            let id = session.next_file_id;
+            session.next_file_id += 1;
+            session.sending_files += 1;
+            session.notice = Some((format!("Enviando {name}…"), Instant::now()));
+            new_toasts.push((format!("Enviando {name}…"), false));
+            let h = session.handle.clone();
+            let tx = session.res_tx.clone();
+            let c = ctx.clone();
+            // Leitura e envio fora da thread da UI.
+            app.rt.spawn(async move {
+                let res = match tokio::fs::read(&path).await {
+                    Ok(bytes) => match h.send_file(id, &name, &bytes).await {
+                        Ok(()) => Ok(format!("{name} enviado.")),
+                        Err(e) => {
                             tracing::warn!(error = %e, "falha ao enviar arquivo");
+                            Err(format!("Não consegui enviar {name}: {e}"))
                         }
-                    });
-                }
-                Err(e) => session.notice = Some((format!("Não consegui ler o arquivo: {e}"), Instant::now())),
-            }
+                    },
+                    Err(e) => Err(format!("Não consegui ler o arquivo {name}: {e}")),
+                };
+                let _ = tx.send(("file", res));
+                c.request_repaint();
+            });
         }
     }
 
@@ -325,14 +403,26 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
     let h = session.handle.clone();
     if let Some(i) = select_monitor {
         let h = h.clone();
+        session.busy_monitor = true;
+        let (tx, c) = (session.res_tx.clone(), ctx.clone());
         app.rt.spawn(async move {
-            let _ = h.select_monitor(i).await;
+            let res = h.select_monitor(i).await.map(|_| format!("Monitor {} selecionado.", i + 1)).map_err(|e| format!("Não consegui trocar de monitor: {e}"));
+            let _ = tx.send(("monitor", res));
+            c.request_repaint();
         });
     }
     if sas {
         let h = h.clone();
+        session.busy_sas = true;
+        let (tx, c) = (session.res_tx.clone(), ctx.clone());
         app.rt.spawn(async move {
-            let _ = h.send_sas().await;
+            let res = h
+                .send_sas()
+                .await
+                .map(|_| "Ctrl+Alt+Del enviado.".to_string())
+                .map_err(|e| format!("Não consegui enviar Ctrl+Alt+Del: {e}"));
+            let _ = tx.send(("sas", res));
+            c.request_repaint();
         });
     }
     if !to_send.is_empty() {
@@ -345,9 +435,16 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
     }
     for text in chats {
         let h = h.clone();
+        let (tx, c) = (session.res_tx.clone(), ctx.clone());
         app.rt.spawn(async move {
-            let _ = h.send_chat(&text).await;
+            if let Err(e) = h.send_chat(&text).await {
+                let _ = tx.send(("chat", Err(format!("Não consegui enviar a mensagem: {e}"))));
+                c.request_repaint();
+            }
         });
+    }
+    for (t, e) in new_toasts {
+        app.toasts.push((t, Instant::now(), e));
     }
 
     // Aplica a alternância "manter no topo" só quando mudou.

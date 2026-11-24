@@ -139,6 +139,34 @@ pub fn primary_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> egui::Re
     )
 }
 
+/// Botão de ação demorada: enquanto `busy`, fica desabilitado com `busy_label`
+/// (gerúndio) e um spinner ao lado. `primary` usa o estilo de destaque.
+/// O retorno só tem `clicked()` verdadeiro quando não está ocupado.
+pub fn action_button(ui: &mut egui::Ui, pal: &Palette, busy: bool, primary: bool, label: &str, busy_label: &str) -> egui::Response {
+    if busy {
+        let r = ui.add_enabled(false, egui::Button::new(busy_label).min_size(egui::vec2(0.0, 34.0)).rounding(8.0));
+        ui.spinner();
+        return r.on_disabled_hover_text("Aguarde, isso ainda está em andamento.");
+    }
+    if primary {
+        primary_button(ui, pal, label)
+    } else {
+        ui.add(egui::Button::new(label).min_size(egui::vec2(0.0, 34.0)).rounding(8.0))
+    }
+}
+
+/// Botão de destaque que pode ficar desabilitado (com a explicação no hover).
+pub fn primary_button_if(ui: &mut egui::Ui, pal: &Palette, enabled: bool, label: &str, why_disabled: &str) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(label).size(15.0).strong().color(pal.on_accent))
+            .fill(pal.accent)
+            .min_size(egui::vec2(0.0, 34.0))
+            .rounding(8.0),
+    )
+    .on_disabled_hover_text(why_disabled)
+}
+
 /// Filled red button for destructive actions.
 pub fn danger_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> egui::Response {
     ui.add(

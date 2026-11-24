@@ -453,6 +453,8 @@ pub struct DiscoveredDevice {
     pub port: u16,
     /// ID curto de 9 dígitos do host.
     pub short_id: String,
+    /// Aceita conexões agora (falso = app aberto, mas sem compartilhar a tela).
+    pub accepting: bool,
 }
 
 /// Descoberta de hosts Elo na rede local.
@@ -496,7 +498,7 @@ impl Discovery {
             Some(h) => h
                 .devices()
                 .into_iter()
-                .map(|d| DiscoveredDevice { name: d.name, ip: d.ip, port: d.port, short_id: d.short_id })
+                .map(|d| DiscoveredDevice { name: d.name, ip: d.ip, port: d.port, short_id: d.short_id, accepting: d.accepting })
                 .collect(),
             None => Vec::new(),
         }

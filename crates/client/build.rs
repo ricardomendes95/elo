@@ -28,7 +28,7 @@ fn set_version_info(res: &mut winresource::WindowsResource, product: &str, descr
 #[cfg(windows)]
 const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="Elo.Client" version="0.1.0.0" processorArchitecture="amd64"/>
+  <assemblyIdentity type="win32" name="Elo.Client" version="0.3.5.0" processorArchitecture="amd64"/>
   <description>Elo - cliente de linha de comando</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
