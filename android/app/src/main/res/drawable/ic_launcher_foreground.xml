@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Dois elos de corrente entrelaçados, inclinados 45° -->
+    <group android:pivotX="42" android:pivotY="66" android:rotation="-45">
+        <path
+            android:strokeColor="#2DD4BF" android:strokeWidth="6" android:strokeLineJoin="round"
+            android:pathData="M28,56h28a10,10 0,0 1,0 20h-28a10,10 0,0 1,0 -20z" />
+    </group>
+    <group android:pivotX="66" android:pivotY="42" android:rotation="-45">
+        <path
+            android:strokeColor="#2DD4BF" android:strokeWidth="6" android:strokeLineJoin="round"
+            android:pathData="M52,32h28a10,10 0,0 1,0 20h-28a10,10 0,0 1,0 -20z" />
+    </group>
+</vector>

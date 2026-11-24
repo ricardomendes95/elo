@@ -259,6 +259,23 @@ Observação: o `u32` de tamanho da camada 3 é **big-endian** (framing), enquan
   é tratado como um byte-stream; por cima vêm as camadas 2 e 3.
 - **Relay próprio**: o socket TCP do relay depois do `Paired`.
 
+## 4c. Descoberta na LAN (broadcast UDP)
+
+Fora do canal cifrado, para achar hosts na própria rede (`crates/client-core/src/discovery.rs`):
+
+- O host (quem quer ser encontrado) envia a cada **~2 s** um datagrama UDP para
+  `255.255.255.255:9001` (`DISCOVERY_PORT`, **separada** da `DIRECT_PORT = 9000`).
+- Formato: JSON `{"elo":1,"name":<nome>,"id":<short_id>,"port":<porta>}`. Pacotes sem
+  `"elo":1` ou malformados são ignorados.
+- Quem procura faz bind em `0.0.0.0:9001` e monta a lista com chave = IP de origem; entradas
+  não vistas há mais de **10 s** são podadas. A `port` vem do datagrama; o IP é o de origem.
+- Só vale na LAN/sub-rede (broadcast não atravessa a internet) e é apenas um auxílio para
+  encontrar o endereço — a conexão em si continua exigindo senha/aprovação/2FA.
+
+Nota: a transferência de arquivo host → controlador passou a ter **emissor** (o host origina
+`FileOffer`/`FileChunk`/`FileDone` via `HostLink`; ver [arquitetura.md](arquitetura.md)), não só
+o controlador. As variantes de arquivo já valem para **ambos** os sentidos (tabela acima).
+
 ## 5. Ordem do handshake de sessão (v2)
 
 Depois que o transporte está pronto (TCP/QUIC/relay):

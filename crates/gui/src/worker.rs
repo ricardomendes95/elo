@@ -84,6 +84,7 @@ pub async fn run_headless(state_dir: PathBuf) {
         status: Arc::new(Mutex::new(String::new())),
         online_text: format!("serviço online — LAN :{DIRECT_PORT}"),
         after_session: Arc::new(|| {}),
+        link_out: None,
     })
     .await
 }

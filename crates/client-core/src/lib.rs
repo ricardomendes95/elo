@@ -10,9 +10,16 @@ use elo_protocol::{InputEvent, MonitorInfo};
 pub mod audio;
 pub mod clipboard;
 pub mod codec;
+#[cfg(feature = "h264")]
+pub mod codec_h264;
+#[cfg(not(feature = "h264"))]
+#[path = "codec_h264_stub.rs"]
 pub mod codec_h264;
 pub mod controller;
+pub mod discovery;
 pub mod host;
+
+pub use host::HostLink;
 #[cfg(windows)]
 pub mod platform;
 pub mod rendezvous;

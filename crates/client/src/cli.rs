@@ -187,7 +187,7 @@ async fn run_controller_mode(opts: HashMap<String, String>) -> Result<()> {
         };
         let node = elo_p2p::bind_node_ephemeral().await?;
         let duplex = node.connect(&node_id).await?;
-        let co = ConnectOptions { name: None, totp_code: opts.get("code").cloned() };
+        let co = ConnectOptions { name: None, totp_code: opts.get("code").cloned(), ..Default::default() };
         let (h, e) = connect_on_opts(duplex, &keypair, &password, download_dir(), co).await?;
         _node_keepalive = Some(node);
         (h, e, target.clone())
@@ -251,6 +251,8 @@ async fn run_controller_mode(opts: HashMap<String, String>) -> Result<()> {
             }
             ControllerEvent::Chat(text) => println!("host: {text}"),
             ControllerEvent::FileReceived { path } => println!("received file: {}", path.display()),
+            // Only with `ConnectOptions::raw_media` (not used by the CLI).
+            ControllerEvent::FrameH264 { .. } | ControllerEvent::Audio { .. } | ControllerEvent::Clipboard(_) => {}
             ControllerEvent::Disconnected => {
                 println!("session ended.");
                 break;

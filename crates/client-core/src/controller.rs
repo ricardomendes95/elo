@@ -55,6 +55,12 @@ pub struct ConnectOptions {
     pub name: Option<String>,
     /// Authenticator code, if the host has 2FA on.
     pub totp_code: Option<String>,
+    /// Hand video, audio and clipboard to the caller undecoded
+    /// ([`ControllerEvent::FrameH264`], [`ControllerEvent::Audio`],
+    /// [`ControllerEvent::Clipboard`]) instead of decoding/playing/applying them
+    /// here. Used by the Android app (MediaCodec, AudioTrack, ClipboardManager).
+    /// When set, `Caps` announces `h264: true` and `audio: true`.
+    pub raw_media: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +71,16 @@ pub enum ControllerEvent {
     Monitors(Vec<MonitorInfo>),
     Chat(String),
     FileReceived { path: PathBuf },
+    /// Only with [`ConnectOptions::raw_media`]: one H.264 Annex-B access unit,
+    /// exactly as the host sent it (`key` = IDR). `width`/`height` are the
+    /// host's real size (the coded size may be 1 px larger when odd).
+    FrameH264 { width: u32, height: u32, key: bool, data: Vec<u8> },
+    /// Only with [`ConnectOptions::raw_media`]: PCM s16le, interleaved. Not sent
+    /// while audio is muted ([`ControllerHandle::set_audio`]).
+    Audio { rate: u32, channels: u16, pcm: Vec<u8> },
+    /// Text the host copied. Emitido no modo raw e também no modo desktop
+    /// (neste, o texto já foi aplicado no clipboard local; o evento é só aviso).
+    Clipboard(String),
     Disconnected,
 }
 
@@ -76,6 +92,7 @@ pub struct ControllerHandle {
     pub peer_fingerprint: Vec<u8>,
     outbound: mpsc::Sender<Vec<u8>>,
     audio_on: Arc<AtomicBool>,
+    close: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl ControllerHandle {
@@ -112,6 +129,21 @@ impl ControllerHandle {
     }
     pub fn audio(&self) -> bool {
         self.audio_on.load(Ordering::Relaxed)
+    }
+
+    /// Send our clipboard text to the host (raw-media mode; the desktop syncs
+    /// it automatically). Ignored by the host without the clipboard permission.
+    pub async fn send_clipboard(&self, text: &str) -> Result<()> {
+        if text.len() > 1024 * 1024 {
+            bail!("texto grande demais para a área de transferência (máx. 1 MiB)");
+        }
+        self.send(SessionMsg::Clipboard(text.to_string())).await
+    }
+
+    /// End the session: closes the connection; the event stream then yields
+    /// [`ControllerEvent::Disconnected`].
+    pub fn close(&self) {
+        let _ = self.close.send(true);
     }
 
     pub async fn send_file(&self, id: TransferId, name: &str, bytes: &[u8]) -> Result<()> {
@@ -222,8 +254,8 @@ where
         }
     }
     enc.send(&encode_msg(&SessionMsg::Caps {
-        h264: crate::codec_h264::available(),
-        audio: crate::audio::available(),
+        h264: opts.raw_media || crate::codec_h264::available(),
+        audio: opts.raw_media || crate::audio::available(),
     }))
     .await?;
 
@@ -240,15 +272,28 @@ where
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
     let (ev_tx, ev_rx) = mpsc::channel::<ControllerEvent>(64);
     let audio_on = Arc::new(AtomicBool::new(true));
+    let close = Arc::new(tokio::sync::watch::channel(false).0);
+    let raw = opts.raw_media;
 
-    // Writer: single owner of the encrypted sender.
+    // Writer: single owner of the encrypted sender. Dropping it on `close`
+    // ends the connection, which ends the reader with `Disconnected`.
     let mut sender = tx;
+    let mut close_w = close.subscribe();
     tokio::spawn(async move {
-        while let Some(bytes) = out_rx.recv().await {
-            if sender.send(&bytes).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                _ = closed(&mut close_w) => break,
+                next = out_rx.recv() => match next {
+                    Some(bytes) => {
+                        if sender.send(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
             }
         }
+        let _ = sender.shutdown().await;
     });
 
     // Keepalive.
@@ -265,7 +310,7 @@ where
 
     // Clipboard (text) both ways, when the host allows it.
     let (clip_tx, mut clip_rx) = mpsc::channel::<String>(8);
-    let clipboard = if permissions.clipboard { ClipboardBridge::start(clip_tx) } else { None };
+    let clipboard = if permissions.clipboard && !raw { ClipboardBridge::start(clip_tx) } else { None };
     let clip_out = out_tx.clone();
     tokio::spawn(async move {
         while let Some(t) = clip_rx.recv().await {
@@ -277,6 +322,7 @@ where
 
     // Reader: decode frames and dispatch events.
     let audio_flag = audio_on.clone();
+    let mut close_r = close.subscribe();
     tokio::spawn(async move {
         let clipboard = clipboard; // owned by the reader for the session's life
         let mut tiles = Decoder::new();
@@ -286,7 +332,11 @@ where
         let mut player_failed = false;
         let mut incoming: Option<IncomingFile> = None;
         loop {
-            let bytes = match rx.recv().await {
+            let received = tokio::select! {
+                r = rx.recv() => r,
+                _ = closed(&mut close_r) => Err(anyhow::anyhow!("closed locally")),
+            };
+            let bytes = match received {
                 Ok(b) => b,
                 Err(_) => {
                     let _ = ev_tx.send(ControllerEvent::Disconnected).await;
@@ -309,6 +359,9 @@ where
                     }
                     Err(e) => warn!(error = %e, "frame decode failed"),
                 },
+                SessionMsg::FrameH264 { width, height, key, data } if raw => {
+                    let _ = ev_tx.send(ControllerEvent::FrameH264 { width, height, key, data }).await;
+                }
                 SessionMsg::FrameH264 { data, .. } => {
                     if h264.is_none() {
                         match H264Decoder::new() {
@@ -337,6 +390,11 @@ where
                 SessionMsg::Monitors { list } => {
                     let _ = ev_tx.send(ControllerEvent::Monitors(list)).await;
                 }
+                SessionMsg::Audio { rate, channels, pcm } if raw => {
+                    if audio_flag.load(Ordering::Relaxed) {
+                        let _ = ev_tx.send(ControllerEvent::Audio { rate, channels, pcm }).await;
+                    }
+                }
                 SessionMsg::Audio { rate, channels, pcm } => {
                     if !audio_flag.load(Ordering::Relaxed) || player_failed {
                         continue;
@@ -355,10 +413,16 @@ where
                         p.push(rate, channels, &pcm);
                     }
                 }
+                SessionMsg::Clipboard(text) if raw => {
+                    let _ = ev_tx.send(ControllerEvent::Clipboard(text)).await;
+                }
                 SessionMsg::Clipboard(text) => {
+                    // Aplica localmente (modo desktop) e também avisa a UI, para
+                    // que ela possa exibir que o host copiou algo.
                     if let Some(c) = &clipboard {
-                        c.set(text);
+                        c.set(text.clone());
                     }
+                    let _ = ev_tx.send(ControllerEvent::Clipboard(text)).await;
                 }
                 SessionMsg::Chat(text) => {
                     let _ = ev_tx.send(ControllerEvent::Chat(text)).await;
@@ -394,9 +458,14 @@ where
     });
 
     Ok((
-        ControllerHandle { screen, permissions, peer_fingerprint, outbound: out_tx, audio_on },
+        ControllerHandle { screen, permissions, peer_fingerprint, outbound: out_tx, audio_on, close },
         ev_rx,
     ))
+}
+
+/// Resolves once [`ControllerHandle::close`] was called (or the handle is gone).
+async fn closed(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = rx.wait_for(|c| *c).await;
 }
 
 /// H.264 pads odd sizes to even; crop back to the host's real screen size.

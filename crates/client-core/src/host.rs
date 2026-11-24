@@ -33,7 +33,7 @@ use crate::clipboard::ClipboardBridge;
 use crate::codec::Encoder;
 use crate::codec_h264::H264Encoder;
 use crate::rendezvous::{auth_proof, register_host};
-use crate::transfer::IncomingFile;
+use crate::transfer::{chunks, IncomingFile};
 use crate::{totp, Capture, InputSink};
 
 /// Who is connecting.
@@ -76,6 +76,46 @@ impl HostSessionHandle {
     }
 }
 
+/// Envia conteúdo do host para o controlador conectado na sessão ativa.
+///
+/// É entregue à UI do host por [`HostOptions::link_out`] quando uma sessão fica
+/// ativa e removido (`None`) ao desconectar. Os métodos são "dispare e esqueça":
+/// agendam o envio na runtime Tokio da sessão, usando o mesmo canal de saída do
+/// loop do host (logo, respeitam o backpressure do caminho de transferência em
+/// chunks — `FileOffer`/`FileChunk`/`FileDone`, CHUNK de 60 KiB).
+#[derive(Clone)]
+pub struct HostLink {
+    out: mpsc::Sender<Vec<u8>>,
+    rt: tokio::runtime::Handle,
+}
+
+impl HostLink {
+    /// Envia um arquivo ao controlador conectado (chunked, em segundo plano).
+    pub fn send_file(&self, name: String, data: Vec<u8>) {
+        let out = self.out.clone();
+        self.rt.spawn(async move {
+            let id: elo_protocol::TransferId = rand::random();
+            if out.send(encode_msg(&SessionMsg::FileOffer { id, name, size: data.len() as u64 })).await.is_err() {
+                return;
+            }
+            for (offset, chunk) in chunks(&data) {
+                if out.send(encode_msg(&SessionMsg::FileChunk { id, offset, data: chunk.to_vec() })).await.is_err() {
+                    return;
+                }
+            }
+            let _ = out.send(encode_msg(&SessionMsg::FileDone { id })).await;
+        });
+    }
+
+    /// Envia texto para a área de transferência do controlador (em segundo plano).
+    pub fn send_clipboard(&self, text: String) {
+        let out = self.out.clone();
+        self.rt.spawn(async move {
+            let _ = out.send(encode_msg(&SessionMsg::Clipboard(text))).await;
+        });
+    }
+}
+
 /// Async "Allow?" callback: returns true to allow.
 pub type ApproveFn = Arc<dyn Fn(PeerInfo) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 /// Event sink.
@@ -101,6 +141,10 @@ pub struct HostOptions {
     pub prefer_h264: bool,
     /// Report the operator's pointer (view-only sessions) via `on_event`.
     pub show_pointer: bool,
+    /// Receptáculo para o [`HostLink`] da sessão ativa. Quando uma sessão de
+    /// controlador fica ativa, o host grava `Some(link)`; ao desconectar, `None`.
+    /// A UI do host lê daqui para enviar arquivos/clipboard ao controlador.
+    pub link_out: Option<std::sync::Arc<std::sync::Mutex<Option<HostLink>>>>,
 }
 
 impl HostOptions {
@@ -118,6 +162,7 @@ impl HostOptions {
             download_dir,
             prefer_h264: true,
             show_pointer: true,
+            link_out: None,
         }
     }
 
@@ -366,6 +411,12 @@ where
         session: HostSessionHandle { out: out_tx.clone(), cancel: cancel_tx },
     });
 
+    // Publica o canal de saída desta sessão para a UI do host (envio de
+    // arquivos/clipboard ao controlador). Limpo ao desconectar.
+    if let Some(slot) = &opts.link_out {
+        *slot.lock().unwrap() = Some(HostLink { out: out_tx.clone(), rt: tokio::runtime::Handle::current() });
+    }
+
     // Writer: the single owner of the encrypted sender.
     let mut sender = tx;
     let writer = tokio::spawn(async move {
@@ -603,6 +654,9 @@ where
         t.abort();
     }
     drop(clipboard);
+    if let Some(slot) = &opts.link_out {
+        *slot.lock().unwrap() = None;
+    }
     opts.emit(HostEvent::Disconnected { peer });
     result
 }

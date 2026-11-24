@@ -8,6 +8,7 @@ members = [
     "crates/client",
     "crates/gui",
     "crates/p2p",
+    "crates/android",
 ]
 # `cargo build`/`cargo test` with no target skip the GUI (it pulls a windowing
 # stack); build it explicitly with `cargo run -p elo-gui`.

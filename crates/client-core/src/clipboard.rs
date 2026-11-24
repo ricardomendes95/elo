@@ -2,6 +2,8 @@
 //! clipboard; local changes are sent to the peer, and text received from the
 //! peer is applied locally (without echoing it back).
 
+#![cfg_attr(not(feature = "clipboard"), allow(unused_imports, dead_code))]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as smpsc, Arc};
 use std::time::Duration;
@@ -19,6 +21,15 @@ pub struct ClipboardBridge {
 impl ClipboardBridge {
     /// Start watching the local clipboard. Local changes are sent to `out`.
     /// Returns `None` when no clipboard is available (e.g. headless).
+    ///
+    /// Without the `clipboard` feature (Android) this always returns `None`;
+    /// the app syncs text through the raw `Clipboard` events instead.
+    #[cfg(not(feature = "clipboard"))]
+    pub fn start(_out: mpsc::Sender<String>) -> Option<Self> {
+        None
+    }
+
+    #[cfg(feature = "clipboard")]
     pub fn start(out: mpsc::Sender<String>) -> Option<Self> {
         let (set_tx, set_rx) = smpsc::channel::<String>();
         let (ready_tx, ready_rx) = smpsc::channel::<bool>();

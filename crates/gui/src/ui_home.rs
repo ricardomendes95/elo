@@ -5,7 +5,7 @@ use egui::{Sense, Vec2};
 
 use crate::hostrun::DIRECT_PORT;
 use crate::theme::{self, banner, card, dot, info_card, nav_item, paint_logo, primary_button, section_title};
-use crate::{random_code, short_fp, App, Conn, View};
+use crate::{random_code, short_fp, App, Conn, RenameTarget, View};
 use elo_protocol::format_id;
 
 pub fn draw_shell(app: &mut App, ctx: &egui::Context) {
@@ -31,6 +31,9 @@ pub fn draw_shell(app: &mut App, ctx: &egui::Context) {
             if nav_item(ui, &pal, app.view == View::Settings, "Configurações") {
                 app.view = View::Settings;
             }
+            if nav_item(ui, &pal, app.view == View::Manual, "Manual") {
+                app.view = View::Manual;
+            }
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 let status = app.host_status.lock().unwrap().clone();
                 let online = status.contains("online") || status.starts_with("pronto");
@@ -48,6 +51,8 @@ pub fn draw_shell(app: &mut App, ctx: &egui::Context) {
     // Someone is connected to THIS computer.
     let mut kick = false;
     let mut open_chat = false;
+    let mut pick_file = false;
+    let host_link = app.host_link.lock().unwrap().clone();
     if let Some(s) = &app.host_session {
         egui::TopBottomPanel::top("host-session")
             .frame(egui::Frame::none().fill(pal.danger.linear_multiply(0.22)).inner_margin(egui::Margin::symmetric(16.0, 8.0)))
@@ -64,6 +69,9 @@ pub fn draw_shell(app: &mut App, ctx: &egui::Context) {
                         if ui.button("Chat").clicked() {
                             open_chat = true;
                         }
+                        if host_link.is_some() && ui.button("Enviar arquivo").clicked() {
+                            pick_file = true;
+                        }
                     });
                 });
             });
@@ -76,6 +84,20 @@ pub fn draw_shell(app: &mut App, ctx: &egui::Context) {
             s.chat_open = true;
         }
     }
+    if pick_file {
+        if let Some(link) = host_link {
+            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "arquivo".into());
+                        app.toast(format!("Enviando {name} ({} KB) ao computador remoto…", bytes.len() / 1024));
+                        link.send_file(name, bytes);
+                    }
+                    Err(e) => app.toast(format!("Não consegui ler o arquivo: {e}")),
+                }
+            }
+        }
+    }
 
     egui::CentralPanel::default()
         .frame(egui::Frame::none().fill(pal.bg).inner_margin(egui::Margin::symmetric(28.0, 22.0)))
@@ -84,6 +106,7 @@ pub fn draw_shell(app: &mut App, ctx: &egui::Context) {
                 View::Home => page_home(app, ui),
                 View::Favorites => page_favorites(app, ui),
                 View::Settings => crate::ui_settings::page_settings(app, ui),
+                View::Manual => crate::ui_manual::manual_page(ui, &pal),
             });
         });
 }
@@ -139,6 +162,9 @@ fn address_bar(app: &mut App, ui: &mut egui::Ui) {
 
 fn page_home(app: &mut App, ui: &mut egui::Ui) {
     let pal = app.pal;
+    if cfg!(windows) {
+        install_card(app, ui);
+    }
     if app.config.open_access {
         banner(ui, pal.danger, "Acesso não supervisionado ligado: qualquer pessoa com o seu endereço entra sem senha e sem aprovação. Desligue em Configurações → Segurança.");
         ui.add_space(12.0);
@@ -146,6 +172,9 @@ fn page_home(app: &mut App, ui: &mut egui::Ui) {
     ui.heading("Conectar a outro computador");
     ui.add_space(10.0);
     address_bar(app, ui);
+
+    devices_section(app, ui);
+    recents_section(app, ui);
 
     ui.add_space(24.0);
     card(ui, &pal, |ui| {
@@ -209,6 +238,249 @@ fn page_home(app: &mut App, ui: &mut egui::Ui) {
         info_card(&mut c[2], &pal, pal.warn, "Dispositivos pareados",
             "Ao aprovar um pedido, marque \"confiar\" para que aquele dispositivo entre direto nas próximas vezes.");
     });
+
+    ui.add_space(22.0);
+    card(ui, &pal, |ui| {
+        let mut v = app.config.close_to_tray;
+        if ui
+            .checkbox(&mut v, "Continuar na bandeja ao fechar a janela")
+            .on_hover_text("Fechar a janela só esconde o Elo: a conexão e o acesso a este computador continuam ativos. Use o ícone na bandeja para reabrir ou sair.")
+            .changed()
+        {
+            let mut cfg = app.config.clone();
+            cfg.close_to_tray = v;
+            app.draft.close_to_tray = v;
+            app.save_config(cfg);
+        }
+    });
+}
+
+/// Cartão no topo da tela inicial: instalar o Elo no Windows (um clique → UAC)
+/// ou, se já instalado, um aviso discreto com a opção de desinstalar. A cada
+/// frame relê `is_installed()`, então o cartão troca sozinho assim que a
+/// instalação/desinstalação termina.
+fn install_card(app: &mut App, ui: &mut egui::Ui) {
+    let pal = app.pal;
+    let mut do_install = false;
+    let mut do_uninstall = false;
+    if crate::install::is_installed() {
+        egui::Frame::none()
+            .fill(pal.ok.linear_multiply(0.14))
+            .stroke(egui::Stroke::new(1.0_f32, pal.ok))
+            .rounding(12.0)
+            .inner_margin(egui::Margin::same(14.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    dot(ui, pal.ok);
+                    ui.label(
+                        egui::RichText::new(format!("Elo instalado em {}", crate::install::INSTALL_DIR_DISPLAY))
+                            .color(pal.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Desinstalar").clicked() {
+                            do_uninstall = true;
+                        }
+                    });
+                });
+            });
+    } else {
+        card(ui, &pal, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new("Instalar no Windows").strong().size(15.0).color(pal.text));
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Copia o Elo para Arquivos de Programas e faz com que ele inicie junto com o Windows, \
+                     em segundo plano, com permissão de administrador. O Windows pedirá a sua confirmação (UAC).",
+                )
+                .color(pal.muted),
+            );
+            ui.add_space(10.0);
+            if primary_button(ui, &pal, "  Instalar  ").clicked() {
+                do_install = true;
+            }
+        });
+    }
+    if do_install {
+        match crate::install::elevate_install() {
+            Ok(()) => app.toast("Instalando… confirme no UAC. A instalação roda em segundo plano."),
+            Err(e) => app.toast(format!("Não foi possível iniciar a instalação: {e}")),
+        }
+    }
+    if do_uninstall {
+        match crate::install::elevate_uninstall() {
+            Ok(()) => app.toast("Desinstalando… confirme no UAC."),
+            Err(e) => app.toast(format!("Não foi possível iniciar a desinstalação: {e}")),
+        }
+    }
+    ui.add_space(12.0);
+}
+
+/// "Dispositivos na rede": devices announced on the LAN. Clicking connects.
+fn devices_section(app: &mut App, ui: &mut egui::Ui) {
+    let pal = app.pal;
+    let devices = app.discovery.as_ref().map(|h| h.devices()).unwrap_or_default();
+    ui.add_space(22.0);
+    let mut refresh = false;
+    ui.horizontal(|ui| {
+        section_title(ui, &pal, "Dispositivos na rede");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Atualizar").clicked() {
+                refresh = true;
+            }
+        });
+    });
+    ui.add_space(8.0);
+    let mut connect: Option<usize> = None;
+    if devices.is_empty() {
+        card(ui, &pal, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Nenhum computador com o Elo encontrado na rede local. Toque em Atualizar para procurar de novo.",
+                )
+                .color(pal.muted),
+            );
+        });
+        ui.add_space(8.0);
+    }
+    for (i, d) in devices.iter().enumerate() {
+        card(ui, &pal, |ui| {
+            ui.horizontal(|ui| {
+                dot(ui, pal.ok);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(&d.name).strong().size(15.0).color(pal.text));
+                    ui.label(egui::RichText::new(format!("Rede local · {}", d.ip)).small().color(pal.muted));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if primary_button(ui, &pal, "Conectar").clicked() {
+                        connect = Some(i);
+                    }
+                });
+            });
+        });
+        ui.add_space(8.0);
+    }
+    if refresh {
+        // Solta o handle antigo (limpa o mapa) e recria o escutador: começa
+        // vazio e volta a se preencher com os anúncios dos próximos instantes.
+        let _g = app.rt.enter();
+        app.discovery = elo_client_core::discovery::listen().ok();
+    }
+    if let Some(i) = connect {
+        app.mode_lan = true;
+        app.remote_addr = devices[i].ip.clone();
+        app.start_connect(None);
+    }
+}
+
+/// "Últimos acessos": recently connected computers, with online dot, rename,
+/// remove and one-click reconnect.
+fn recents_section(app: &mut App, ui: &mut egui::Ui) {
+    let pal = app.pal;
+    if app.config.recents.is_empty() {
+        return;
+    }
+    ui.add_space(22.0);
+    section_title(ui, &pal, "Últimos acessos");
+    ui.add_space(8.0);
+    let presence = app.presence.lock().unwrap().clone();
+    let mut connect: Option<usize> = None;
+    let mut remove: Option<usize> = None;
+    let mut add_fav: Option<usize> = None;
+    let mut start_rename: Option<usize> = None;
+    let mut commit_rename = false;
+    let mut cancel_rename = false;
+    for (i, r) in app.config.recents.iter().enumerate() {
+        card(ui, &pal, |ui| {
+            ui.horizontal(|ui| {
+                let color = match presence.get(&r.address) {
+                    Some(true) => pal.ok,
+                    _ => pal.muted,
+                };
+                dot(ui, color);
+                if app.rename == Some(RenameTarget::Recent(i)) {
+                    let resp = ui.add(egui::TextEdit::singleline(&mut app.rename_buf).desired_width(180.0).hint_text("nome"));
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if primary_button(ui, &pal, "Salvar").clicked() || enter {
+                        commit_rename = true;
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        cancel_rename = true;
+                    }
+                } else {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(&r.name).strong().size(15.0).color(pal.text));
+                        let kind = if r.lan { "Rede local" } else { "Internet" };
+                        let addr: String = if r.address.len() > 28 { format!("{}…", &r.address[..28]) } else { r.address.clone() };
+                        ui.label(egui::RichText::new(format!("{kind} · {addr}")).small().color(pal.muted));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Remover").clicked() {
+                            remove = Some(i);
+                        }
+                        if ui.button("Favoritar").clicked() {
+                            add_fav = Some(i);
+                        }
+                        if ui.button("Renomear").clicked() {
+                            start_rename = Some(i);
+                        }
+                        if primary_button(ui, &pal, "Conectar").clicked() {
+                            connect = Some(i);
+                        }
+                    });
+                }
+            });
+        });
+        ui.add_space(8.0);
+    }
+    if let Some(i) = add_fav {
+        let r = app.config.recents[i].clone();
+        if app.add_favorite_unique(r.name, r.address, r.lan, r.password) {
+            app.toast("Adicionado aos favoritos.");
+        } else {
+            app.toast("Já está nos favoritos.");
+        }
+    }
+    if let Some(i) = start_rename {
+        app.rename = Some(RenameTarget::Recent(i));
+        app.rename_buf = app.config.recents[i].name.clone();
+    }
+    if cancel_rename {
+        app.rename = None;
+    }
+    if commit_rename {
+        if let Some(RenameTarget::Recent(i)) = app.rename {
+            let name = app.rename_buf.trim().to_string();
+            if !name.is_empty() && i < app.config.recents.len() {
+                let mut cfg = app.config.clone();
+                cfg.recents[i].name = name;
+                app.draft.recents = cfg.recents.clone();
+                app.save_config(cfg);
+            }
+        }
+        app.rename = None;
+    }
+    if let Some(i) = remove {
+        let mut cfg = app.config.clone();
+        cfg.recents.remove(i);
+        app.draft.recents = cfg.recents.clone();
+        app.save_config(cfg);
+        app.rename = None;
+    }
+    if let Some(i) = connect {
+        let r = app.config.recents[i].clone();
+        app.mode_lan = r.lan;
+        app.remote_addr = r.address.clone();
+        if r.password.is_empty() {
+            // Sem senha salva: preenche o endereço e deixa o usuário digitar a
+            // senha (salva ou dinâmica) na barra de conexão.
+            app.remote_password.clear();
+        } else {
+            app.remote_password = r.password.clone();
+            app.start_connect(None);
+        }
+    }
 }
 
 fn page_favorites(app: &mut App, ui: &mut egui::Ui) {
@@ -237,6 +509,9 @@ fn page_favorites(app: &mut App, ui: &mut egui::Ui) {
     let presence = app.presence.lock().unwrap().clone();
     let mut connect: Option<usize> = None;
     let mut remove: Option<usize> = None;
+    let mut start_rename: Option<usize> = None;
+    let mut commit_rename = false;
+    let mut cancel_rename = false;
     for (i, fav) in app.config.favorites.iter().enumerate() {
         card(ui, &pal, |ui| {
             ui.horizontal(|ui| {
@@ -246,23 +521,56 @@ fn page_favorites(app: &mut App, ui: &mut egui::Ui) {
                     None => (pal.muted, "verificando…"),
                 };
                 dot(ui, color);
-                ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(&fav.name).strong().size(15.0).color(pal.text));
-                    let kind = if fav.lan { "Rede local" } else { "Internet" };
-                    let addr: String = if fav.address.len() > 28 { format!("{}…", &fav.address[..28]) } else { fav.address.clone() };
-                    ui.label(egui::RichText::new(format!("{label} · {kind} · {addr}")).small().color(pal.muted));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Remover").clicked() {
-                        remove = Some(i);
+                if app.rename == Some(RenameTarget::Favorite(i)) {
+                    let resp = ui.add(egui::TextEdit::singleline(&mut app.rename_buf).desired_width(180.0).hint_text("nome"));
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if primary_button(ui, &pal, "Salvar").clicked() || enter {
+                        commit_rename = true;
                     }
-                    if primary_button(ui, &pal, "Conectar").clicked() {
-                        connect = Some(i);
+                    if ui.button("Cancelar").clicked() {
+                        cancel_rename = true;
                     }
-                });
+                } else {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(&fav.name).strong().size(15.0).color(pal.text));
+                        let kind = if fav.lan { "Rede local" } else { "Internet" };
+                        let addr: String = if fav.address.len() > 28 { format!("{}…", &fav.address[..28]) } else { fav.address.clone() };
+                        ui.label(egui::RichText::new(format!("{label} · {kind} · {addr}")).small().color(pal.muted));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Remover").clicked() {
+                            remove = Some(i);
+                        }
+                        if ui.button("Renomear").clicked() {
+                            start_rename = Some(i);
+                        }
+                        if primary_button(ui, &pal, "Conectar").clicked() {
+                            connect = Some(i);
+                        }
+                    });
+                }
             });
         });
         ui.add_space(8.0);
+    }
+    if let Some(i) = start_rename {
+        app.rename = Some(RenameTarget::Favorite(i));
+        app.rename_buf = app.config.favorites[i].name.clone();
+    }
+    if cancel_rename {
+        app.rename = None;
+    }
+    if commit_rename {
+        if let Some(RenameTarget::Favorite(i)) = app.rename {
+            let name = app.rename_buf.trim().to_string();
+            if !name.is_empty() && i < app.config.favorites.len() {
+                let mut cfg = app.config.clone();
+                cfg.favorites[i].name = name;
+                app.draft.favorites = cfg.favorites.clone();
+                app.save_config(cfg);
+            }
+        }
+        app.rename = None;
     }
     if let Some(i) = connect {
         let fav = app.config.favorites[i].clone();
@@ -274,5 +582,6 @@ fn page_favorites(app: &mut App, ui: &mut egui::Ui) {
         cfg.favorites.remove(i);
         app.draft.favorites = cfg.favorites.clone();
         app.save_config(cfg);
+        app.rename = None;
     }
 }

@@ -55,6 +55,10 @@ impl Session {
 
 pub fn drive_session(app: &mut App, ctx: &egui::Context) {
     let pal = app.pal;
+    // Estado "manter no topo": capturado antes do empréstimo da sessão; o botão
+    // da barra alterna a cópia local e aplicamos a mudança ao final.
+    let on_top_before = app.always_on_top;
+    let mut always_on_top = on_top_before;
     let Conn::Active(session) = &mut app.conn else { return };
 
     // ---- drain events ----
@@ -83,6 +87,12 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
                 session.chat_open = true;
             }
             Ok(ControllerEvent::FileReceived { path }) => session.chat.push(format!("[arquivo recebido: {}]", path.display())),
+            // O bridge já aplica a área de transferência sozinho; aqui só avisamos.
+            Ok(ControllerEvent::Clipboard(_)) => {
+                app.toasts.push(("Área de transferência recebida do computador remoto.".to_string(), Instant::now()));
+            }
+            // Só chegam com `ConnectOptions::raw_media` (app Android); o desktop decodifica/toca aqui mesmo.
+            Ok(ControllerEvent::FrameH264 { .. } | ControllerEvent::Audio { .. }) => {}
             Ok(ControllerEvent::Disconnected) => {
                 disconnected = true;
                 break;
@@ -98,6 +108,7 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
         if session.fullscreen {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
+        restore_window_level(app, ctx);
         app.conn = Conn::Failed("A sessão foi encerrada.".into());
         return;
     }
@@ -148,6 +159,13 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
                         session.fullscreen = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                     }
+                    if ui
+                        .selectable_label(always_on_top, "Manter no topo")
+                        .on_hover_text("Mantém esta janela acima das outras para você navegar sem perder a sessão de vista.")
+                        .clicked()
+                    {
+                        always_on_top = !always_on_top;
+                    }
                     if ui.button(if session.chat_open { "Fechar chat" } else { "Chat" }).clicked() {
                         session.chat_open = !session.chat_open;
                     }
@@ -172,6 +190,7 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
         if session.fullscreen {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
+        restore_window_level(app, ctx);
         app.conn = Conn::Idle;
         return;
     }
@@ -329,6 +348,21 @@ pub fn drive_session(app: &mut App, ctx: &egui::Context) {
         app.rt.spawn(async move {
             let _ = h.send_chat(&text).await;
         });
+    }
+
+    // Aplica a alternância "manter no topo" só quando mudou.
+    if always_on_top != on_top_before {
+        let level = if always_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        app.always_on_top = always_on_top;
+    }
+}
+
+/// Volta a janela ao nível normal ao sair da sessão (caso estivesse no topo).
+fn restore_window_level(app: &mut App, ctx: &egui::Context) {
+    if app.always_on_top {
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        app.always_on_top = false;
     }
 }
 

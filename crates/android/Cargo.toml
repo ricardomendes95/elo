@@ -1,0 +1,32 @@
+[package]
+name = "elo-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Elo native library for the Android app (controller), exposed to Kotlin via UniFFI"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "elo_android"
+
+[[bin]]
+# Generates the Kotlin bindings from the built library:
+#   cargo run -p elo-android --features bindgen --bin uniffi-bindgen -- generate --library <libelo_android.so> --language kotlin --out-dir <dir>
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+elo-protocol = { path = "../protocol" }
+elo-session = { path = "../session" }
+elo-client-core = { path = "../client-core", default-features = false }
+elo-p2p = { path = "../p2p" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uniffi = "0.29"

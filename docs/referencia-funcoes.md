@@ -82,6 +82,15 @@ Ver [p2p.md](p2p.md): `ALPN`, `PING_ALPN`, `Duplex`, `Node` (`bind_node`, `bind_
 - `struct IncomingFile` → `new(id,name,size)`, `push(offset,&[u8])`, `is_complete()`, `finish() -> Result<Vec<u8>>`
 - `fn chunks(&[u8]) -> impl Iterator<Item=(u64,&[u8])>`
 
+`discovery.rs` (descoberta na LAN por broadcast UDP)
+- `const DISCOVERY_PORT: u16 = 9001` (separada da `DIRECT_PORT = 9000`)
+- `struct DiscoveredDevice { name, ip, port, short_id }`
+- `fn start(name, short_id, port) -> Announcer` — anuncia este dispositivo a cada ~2 s, por **todas** as interfaces
+  IPv4 ativas (função interna `announce_once`, usando o broadcast dirigido de cada sub-rede — ex.: `192.168.0.255` —
+  mais `255.255.255.255` como reforço, na porta 9001); a thread para no `drop` do `Announcer`. Usa o crate `if-addrs`.
+- `fn listen() -> io::Result<DiscoveryHandle>` — escuta anúncios; `DiscoveryHandle` é `Clone`.
+- `DiscoveryHandle::devices() -> Vec<DiscoveredDevice>` — lista atual (poda entradas > 10 s).
+
 `rendezvous.rs`
 - `async fn register_host(relay, device_id, pubkey) -> Result<(TcpStream, Vec<u8>)>`
 - `async fn connect_controller(relay, target_id, pubkey) -> Result<(TcpStream, Vec<u8>)>`
@@ -92,8 +101,13 @@ Ver [p2p.md](p2p.md): `ALPN`, `PING_ALPN`, `Duplex`, `Node` (`bind_node`, `bind_
 `host.rs`
 - `struct PeerInfo { name, fingerprint }`; `enum HostEvent { Connected, Disconnected, AuthFailed, Pointer, Chat, FileReceived }`
 - `struct HostSessionHandle` → `send_chat(&str)`, `disconnect()` (controlar a sessão pela UI do host).
+- `struct HostLink` (Clone) → `send_file(name: String, data: Vec<u8>)`, `send_clipboard(text: String)` —
+  envia do host para o controlador conectado (fire-and-forget; arquivo em chunks de 60 KiB).
 - `struct HostOptions { password, open_access, trusted, totp_secret, approver, on_event, permissions, fps,
-  download_dir, prefer_h264, show_pointer }` + `HostOptions::with_password(...)`.
+  download_dir, prefer_h264, show_pointer, link_out }` + `HostOptions::with_password(...)`.
+  - `link_out: Option<Arc<Mutex<Option<HostLink>>>>` — receptáculo do `HostLink` da sessão ativa
+    (o host grava `Some(link)` ao conectar e `None` ao desconectar; a UI do host lê daqui para enviar
+    arquivo/clipboard ao controlador).
 - `type ApproveFn` (callback assíncrono "permitir?"), `type EventFn`.
 - `async fn run_host(HostConfig, capture, input)` — via relay (só senha).
 - `async fn run_host_direct(DirectHostConfig, capture, input)` — um controller direto, sem relay.
@@ -104,12 +118,17 @@ Ver [p2p.md](p2p.md): `ALPN`, `PING_ALPN`, `Duplex`, `Node` (`bind_node`, `bind_
 
 `controller.rs`
 - `const ERR_2FA_REQUIRED = "2FA_REQUIRED"`
-- `struct ConnectOptions { name: Option<String>, totp_code: Option<String> }`
+- `struct ConnectOptions { name: Option<String>, totp_code: Option<String>, raw_media: bool }` — com `raw_media` o
+  controller anuncia `Caps { h264: true, audio: true }` e **não** decodifica/toca/aplica: entrega `FrameH264`, `Audio`
+  e `Clipboard` crus (app Android) e não inicia o `ClipboardBridge`.
 - `struct ControllerConfig { relay, target_id, keypair, password, download_dir }`, `DirectControllerConfig { host, keypair, password, download_dir }`
-- `enum ControllerEvent { Frame{width,height,bgra}, ScreenChanged{width,height}, Monitors(Vec<MonitorInfo>), Chat(String), FileReceived{path}, Disconnected }`
+- `enum ControllerEvent { Frame{width,height,bgra}, ScreenChanged{width,height}, Monitors(Vec<MonitorInfo>), Chat(String), FileReceived{path}, FrameH264{width,height,key,data}, Audio{rate,channels,pcm}, Clipboard(String), Disconnected }`
+  — `FrameH264`/`Audio`/`Clipboard` só com `raw_media` (`Audio` não chega com o som desligado).
 - `struct ControllerHandle { screen, permissions, peer_fingerprint, … }`
   - `send_input(InputEvent)`, `send_chat(&str)`, `send_pointer(x, y)`, `select_monitor(index)`, `send_sas()`,
-    `send_file(id, name, &[u8])`, `set_audio(bool)`/`audio()` (silenciar localmente).
+    `send_file(id, name, &[u8])`, `set_audio(bool)`/`audio()` (silenciar localmente), `send_clipboard(&str)` (≤ 1 MiB),
+    `close()` — encerra a sessão (fecha o envio; o stream de eventos termina com `Disconnected`). Soltar **todas** as
+    cópias do handle também encerra a sessão.
 - `run_controller(cfg)` — via relay (sem opções); `run_controller_direct(cfg)` / `run_controller_direct_opts(cfg, opts)` —
   direto por IP (timeout de 10 s); `connect_on(stream, &keypair, password, download_dir)` /
   `connect_on_opts(..., opts)` — sobre qualquer stream pronto (P2P/QUIC).
@@ -138,10 +157,42 @@ Subcomandos (um binário faz tudo):
 ## `elo-gui` (o produto, `elo.exe`)
 
 Ver os módulos em [arquitetura.md](arquitetura.md). Principais itens públicos:
-- `config::Config` (campos em [acesso-nao-supervisionado.md](acesso-nao-supervisionado.md)), `Favorite`, `TrustedDevice`,
-  `config_dir()`, `service_dir()`, `seed_service_dir()`, `set_autostart(bool)`.
+- `config::Config` (campos em [acesso-nao-supervisionado.md](acesso-nao-supervisionado.md); inclui
+  `close_to_tray: bool` — fechar a janela esconde na bandeja em vez de sair, padrão `true`), `Favorite`, `TrustedDevice`,
+  `Recent { name, address, lan, password }` (e `Config.recents: Vec<Recent>` — últimos acessos, mais recente
+  primeiro), `config_dir()`, `service_dir()`, `seed_service_dir()`, `set_autostart(bool)`.
 - `hostrun::{HostSettings, HostRun, run, load_or_create_keypair, spawn_directory, DIRECT_PORT = 9000}`.
 - `worker::{run_headless(state_dir), run_worker()}`; `ipc::{Msg, PORT = 47199, token(dir), spawn_gui_server, WorkerLink}`.
 - `service::{is_installed, install, uninstall, elevate, run_dispatcher}` (Windows).
+- `install::{is_installed, installed_exe, install_dir, elevate_install, elevate_uninstall}` (instalação "um clique" do
+  app, distinta do serviço; `run_install`/`run_uninstall` rodam nos modos elevados `--install-app`/`--uninstall-app`).
+  No Windows copia o exe para `C:\Program Files\Elo`, cria a tarefa agendada `Elo` (início no logon, admin, `--tray`) e o
+  atalho no Menu Iniciar; fora do Windows tudo é no-op/stub. `const INSTALL_DIR_DISPLAY = r"C:\Program Files\Elo"`.
 - `logging::{init, log_dir, recent, clear_view}`.
-- `App::{start_host, start_connect, start_connect_fav, save_favorite, save_config}`; `ui_session::drive_session`.
+- `tray::{start, Tray, TrayEvent}` (Windows; stubs no-op nos demais SOs): `start(tooltip: &str, wake: egui::Context) -> io::Result<(Tray, Receiver<TrayEvent>)>`
+  cria o ícone na bandeja e o canal de eventos; a thread chama `wake.request_repaint()` ao emitir um evento (para o `update()`
+  processar "Abrir"/"Sair" com a janela escondida); `enum TrayEvent { Open, Quit }`; `Tray` remove o ícone e encerra a thread no `Drop`.
+- `ui_manual::manual_page(ui: &mut egui::Ui, pal: &Palette)` — renderiza a página **Manual**.
+- `App::{start_host, start_connect, start_connect_fav, save_favorite, save_config, add_favorite_unique}`; `ui_session::drive_session`.
+  `add_favorite_unique(name, address, lan, password) -> bool` adiciona um recente aos favoritos sem duplicar por `address`+`lan`.
+
+## `elo-android` (biblioteca do app Android)
+
+API exposta ao Kotlin via UniFFI (pacote `io.github.ricardomendes95.elo.ffi`); descrição completa em
+[android.md](android.md#api-do-núcleo-elo-android-via-uniffi).
+
+- `Elo::new(data_dir) -> Arc<Elo>`; `device_id()`, `connect(target, lan, password, name, totp_code, directory,
+  download_dir, listener) -> Arc<Session>` (erro `EloError::TwoFaRequired` / `EloError::Failed { msg }`),
+  `is_online(target, lan, directory)` — bloqueantes.
+- `Session`: `info()`, `mouse_move`, `mouse_button(u8, bool)`, `scroll`, `key(u16, bool)`, `char(u32)`, `text`,
+  `pointer`, `chat`, `select_monitor`, `send_sas`, `set_audio`, `send_clipboard`, `send_file`, `hangup` — não bloqueantes,
+  enfileirados em ordem numa tarefa.
+- `trait SessionListener` (implementado em Kotlin): `on_video_h264`, `on_video_bgra`, `on_screen_changed`,
+  `on_monitors`, `on_audio`, `on_clipboard`, `on_chat`, `on_file_received`, `on_disconnected`.
+- `const DIRECT_PORT = 9000`.
+
+`elo-session`: `EncryptedSender::shutdown()` fecha a direção de envio (FIN do TCP / fim do stream QUIC).
+
+`elo-client-core/examples/mock_host.rs`: host de teste com `MockCapture` (1280×720) em `0.0.0.0:9000`, senha `elo`,
+aprovação automática; imprime input/chat recebidos.
+

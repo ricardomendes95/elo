@@ -103,3 +103,41 @@ ligado. Desligado por padrão.
   (afeta a política do sistema).
 - `SendInput` não injeta em janelas elevadas se o host não estiver elevado (UIPI); com o serviço (SYSTEM)
   isso não se aplica.
+- A **descoberta na LAN** anuncia, em broadcast UDP na porta 9001 (pelo broadcast dirigido de cada sub-rede ativa e por
+  `255.255.255.255`), o **nome do dispositivo** e o **short_id** do host: qualquer um na mesma rede/sub-rede vê esses
+  dados (não atravessa a internet). É só um auxílio para localizar o endereço — não expõe tela, input nem arquivos, e a
+  conexão continua exigindo senha/aprovação/2FA.
+
+## Instalador do app (Windows)
+
+O cartão **Instalar no Windows** (tela inicial, `crates/gui/src/install.rs`) faz uma instalação comum de app, sem nada
+silencioso: a ação relança o próprio Elo **elevado**, e o Windows **sempre** pede a confirmação de administrador (UAC).
+Elevado, ele (a) copia o `elo.exe` para `C:\Program Files\Elo`; (b) cria a tarefa agendada `Elo` que o inicia **no logon,
+com privilégios máximos (como admin)** e em segundo plano (`--tray`); (c) cria um atalho no Menu Iniciar. Desinstalar
+desfaz os três, também sob UAC. O app **não** contorna o UAC nem mexe no antivírus; iniciar no logon como admin é
+comportamento normal de um app de acesso remoto que precisa capturar a tela e injetar input. (A tarefa agendada é
+independente do **serviço do Windows**, que continua sendo o caminho para acesso com a tela bloqueada/UAC e Ctrl+Alt+Del.)
+
+## Falso positivo do Windows Defender (sem assinatura)
+
+O `elo.exe` ainda **não é assinado**, então a heurística de aprendizado de máquina do Defender pode
+marcá-lo como falso positivo (`Trojan:Win32/Bearfoos.A!ml`) e até removê-lo. Enquanto não há assinatura de
+código, o módulo `crates/gui/src/defender.rs` oferece uma **ajuda opcional e transparente**:
+
+- Na abertura, o app **lê** as exclusões do Defender (`(Get-MpPreference).ExclusionPath`, numa thread; não
+  exige administrador). Se o `elo.exe` já está coberto por uma exclusão (arquivo ou pasta que o contém),
+  nada aparece.
+- Se não está, um painel explica a situação e oferece três opções: **Adicionar exceção** (dispara um
+  PowerShell elevado via `ShellExecuteW`/`runas` que roda `Add-MpPreference -ExclusionPath <exe>`), **Ver
+  passos manuais** (mostra e copia o comando para rodar à mão) e **Agora não**.
+
+Pontos importantes:
+
+- Adicionar exceção é uma operação **oficial** do Windows e **sempre** passa pelo UAC de administrador; o
+  app não consegue, e não tenta, contornar o antivírus silenciosamente. É só um atalho para um comando que
+  o usuário rodaria de qualquer forma, com o caminho manual à vista.
+- O aviso é dispensável e, se o usuário adicionar a exceção, não volta a aparecer.
+- Isso resolve **só a máquina onde a exceção foi adicionada**. A solução definitiva, que apaga o alerta em
+  qualquer máquina, é **assinar o executável** (ex.: Azure Trusted Signing) ou enviá-lo como falso positivo
+  em `microsoft.com/wdsi/filesubmission`. O recurso é um paliativo para uso interno até a assinatura.
+- Fora do Windows o módulo é no-op e o painel nunca aparece.

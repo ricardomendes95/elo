@@ -105,6 +105,9 @@ pub struct HostRun {
     pub online_text: String,
     /// Called after each successful session (e.g. rotate a one-time password).
     pub after_session: Arc<dyn Fn() + Send + Sync>,
+    /// When set, the host publishes a live link to the connected controller here
+    /// (`Some` while connected, `None` otherwise) so the UI can send it files.
+    pub link_out: Option<Arc<Mutex<Option<elo_client_core::HostLink>>>>,
 }
 
 /// Run the host forever.
@@ -157,6 +160,7 @@ pub async fn run(h: HostRun) {
                 download_dir: h.download_dir.clone(),
                 prefer_h264: true,
                 show_pointer: s.show_pointer,
+                link_out: h.link_out.clone(),
             };
             let factory = || -> anyhow::Result<(DxgiCapture, SendInputSink)> {
                 let c = DxgiCapture::new()?;

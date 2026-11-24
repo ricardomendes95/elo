@@ -1,5 +1,9 @@
 # Porte para Android (APK)
 
+> **Status:** o Caminho A abaixo foi implementado — o app (controller) está em `android/` e o crate em `crates/android`.
+> A documentação do app em si (build, telas, gestos, API) está em [android.md](android.md). Este guia fica como
+> referência de projeto e para o papel de **host** no Android, que ainda não existe.
+
 Objetivo: um app Android que seja **controller** (ver e controlar um host Windows)
 e, opcionalmente, **host** (compartilhar a tela do Android). Há dois caminhos.
 
@@ -37,11 +41,11 @@ uma API fina para o Kotlin. É menos código, sem divergência de protocolo.
    + senha + conectar; "este dispositivo" com o endereço Elo), e a tela de sessão
    renderizando os frames e capturando toque/teclado.
 
-> **Atenção (não verificado):** `elo-client-core` depende de `arboard` (área de transferência) e `openh264`
-> (compilado do código-fonte), e o áudio (`cpal`) só é compilado no Windows. Compilar o núcleo para Android pode exigir
-> *feature flags*/`cfg` para desligar `arboard` e, conforme o caso, `openh264`; ninguém compilou isso para Android ainda.
-> O áudio já é um stub fora do Windows (`audio::available() == false`), então no Android o som deve ser tocado pelo
-> Kotlin (`AudioTrack`) a partir das mensagens `Audio`, o que exige expor esses eventos na API (hoje o núcleo só os toca pelo `AudioPlayer`). O mesmo vale para o `MediaCodec`: o `ControllerEvent` atual só entrega BGRA já decodificado, **não** expõe o `FrameH264` cru; usar o `MediaCodec` exige acrescentar um evento com os bytes Annex-B (mudança no núcleo) ou implementar o controller em Kotlin (Caminho B).
+> **Resolvido:** `arboard` e `openh264` ficaram atrás das features `clipboard` e `h264` do `elo-client-core` (ligadas
+> por padrão; o `elo-android` usa `default-features = false`), o `cpal` já era só Windows, e o núcleo ganhou o modo
+> `ConnectOptions::raw_media`, que entrega `ControllerEvent::FrameH264` (Annex-B), `Audio` (PCM) e `Clipboard` crus para
+> o `MediaCodec`, o `AudioTrack` e o `ClipboardManager`. O iroh compila para `aarch64-linux-android` com o NDK 28 sem
+> ajustes. A API real (nomes um pouco diferentes da sugestão acima) está em [android.md](android.md#api-do-núcleo-elo-android-via-uniffi).
 
 ### Controller no Android (o caso principal)
 
@@ -53,7 +57,7 @@ uma API fina para o Kotlin. É menos código, sem divergência de protocolo.
   - **Decodificação nativa com `MediaCodec` (recomendada para desempenho):** o fluxo de `FrameH264` é **H.264 em
     Annex-B** (NAL units com start code `00 00 00 01`, um frame por mensagem, `key = true` nos IDR). O `MediaCodec`
     (`video/avc`) aceita exatamente esse formato: configure o decoder com um `Surface` e alimente `queueInputBuffer`
-    com `FrameH264.data`; o OpenH264 normalmente emite SPS/PPS junto do IDR (não verificado no código — confirme com um dump do fluxo e, se faltar, extraia SPS/PPS do primeiro keyframe para o `csd-0/csd-1`). Se o dispositivo anunciar `Caps { h264: true }` o host
+    com `FrameH264.data`; o app extrai SPS/PPS do primeiro keyframe para `csd-0`/`csd-1` (e o fluxo também os traz em banda; o decoder do emulador aceitou). Se o dispositivo anunciar `Caps { h264: true }` o host
     manda H.264; para forçar o codec de tiles, anuncie `h264: false`. O tamanho decodificado é **par**
     (largura/altura ímpares do host são acrescidas de 1 px no fluxo; corte para o tamanho do `ScreenInfo`/`FrameH264.width/height`, como faz o núcleo em `controller::crop_to`).
     Para o vídeo H.264 não é preciso a conversão de cor do Rust (o `MediaCodec` faz YUV→RGB na GPU).

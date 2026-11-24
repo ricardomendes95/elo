@@ -9,9 +9,10 @@ O projeto é um workspace Cargo em `crates/`:
 | `elo-protocol` | qualquer | Tipos de fio: mensagens de controle do relay/diretório, mensagens de sessão (v2), framing e helpers de (de)serialização. |
 | `elo-session` | qualquer | Transporte cifrado ponta a ponta: handshake Noise XX + transporte AEAD com framing, sobre qualquer stream `AsyncRead/AsyncWrite`. |
 | `elo-relay` | Linux/qualquer | Servidor de rendezvous + diretório de IDs curtos: pareia host e controller por ID e depois copia bytes cegamente. Nunca vê o conteúdo. |
-| `elo-client-core` | qualquer¹ | Núcleo independente de plataforma: codecs (tiles e H.264), áudio, área de transferência, TOTP, transferência de arquivo, laços de host/controller, rendezvous, e (só no Windows) o backend de captura/input. |
+| `elo-client-core` | qualquer¹ | Núcleo independente de plataforma: codecs (tiles e H.264), áudio, área de transferência, TOTP, transferência de arquivo, descoberta na LAN (broadcast UDP, `discovery.rs`; o anúncio sai por **todas** as interfaces IPv4 ativas, usando o broadcast dirigido de cada sub-rede + `255.255.255.255`, via o crate `if-addrs`), laços de host/controller, rendezvous, e (só no Windows) o backend de captura/input. |
 | `elo-p2p` | qualquer | Transporte P2P pela internet via iroh (QUIC + hole punching + relays gratuitos). Ver [p2p.md](p2p.md). |
 | `elo-client` | Windows¹ | CLI: subcomandos `relay`, `host`, `connect` (relay, direto e P2P). Ferramenta de dev/headless. |
+| `elo-android` | Android | Biblioteca nativa do app Android (`libelo_android.so`, cdylib): API via **UniFFI** sobre `elo-client-core` (sem as features `clipboard`/`h264`) e `elo-p2p`. Ver [android.md](android.md). |
 | `elo-gui` | Windows¹ | **O produto**: janela única (host + controller) e também o executável do serviço/worker. Gera `elo.exe`. |
 
 ¹ O backend de tela/input é `#[cfg(windows)]`. Em Linux os crates compilam
@@ -28,7 +29,12 @@ elo-session ──────────────┘            │
 elo-p2p ───────────────────────────────┼──► elo-gui
                                        └──► (elo-gui também usa elo-p2p direto)
 elo-relay ────────────────────────────────┘ (dev-dep de client-core para o teste e2e)
+elo-client-core (sem default features) + elo-p2p ──► elo-android ──(UniFFI)──► app Kotlin (android/)
 ```
+
+`elo-client-core` tem duas features, ambas no padrão: `clipboard` (área de transferência via `arboard`) e `h264`
+(OpenH264). Sem `h264`, `codec_h264` vira um stub (`available() == false`) e o host cai no codec de tiles; sem
+`clipboard`, `ClipboardBridge::start` devolve `None`.
 
 ## O backend de plataforma (Windows)
 
@@ -70,6 +76,12 @@ rodem contra o hardware real no Windows e contra **mocks** (`MockCapture`, `Reco
    - controller: tarefa de leitura que decodifica vídeo, toca áudio, aplica clipboard e emite
      `ControllerEvent`s; fila de saída para input/chat/arquivos; **keepalive** `Ping` a cada 15 s.
 
+   **Envio host → controlador.** Enquanto a sessão está ativa, o host publica um `HostLink`
+   (`send_file`/`send_clipboard`) em `HostOptions.link_out` (um `Arc<Mutex<Option<HostLink>>>`:
+   `Some` ao conectar, `None` ao desconectar); a UI do host lê daí para mandar arquivo/clipboard ao
+   controlador (botão **Enviar arquivo** na faixa de sessão de host). Assim a transferência de arquivo
+   deixou de ser só controlador → host.
+
 ## Modos de conexão
 
 | Modo | Relay? | Quando | Como as pontas se acham |
@@ -82,18 +94,25 @@ rodem contra o hardware real no Windows e contra **mocks** (`MockCapture`, `Reco
 
 | Módulo | Papel |
 |--------|-------|
-| `main.rs` | Ponto de entrada (modos ocultos `--service`, `--session-worker`, `--install-service`, `--uninstall-service`), `App`, conexão de saída, modais (aprovação, 2FA), toasts, sobreposição do ponteiro, janela de chat do host, presença dos favoritos. |
-| `config.rs` | `Config` persistida (JSON), `Favorite`, `TrustedDevice`, pastas (`config_dir`, `service_dir`), autostart. |
+| `main.rs` | Ponto de entrada (modos ocultos `--service`, `--session-worker`, `--install-service`, `--uninstall-service`, `--install-app`, `--uninstall-app`, e `--tray` que inicia com a janela escondida na bandeja), `App`, conexão de saída, modais (aprovação, 2FA), toasts, sobreposição do ponteiro, janela de chat do host, presença dos favoritos, anúncio de descoberta na LAN (`discovery::start`, enquanto o host está no ar), ícone de bandeja (`drain_tray`/`handle_close` — fechar esconde na bandeja quando `close_to_tray`), `App::add_favorite_unique` (favorita um recente sem duplicar por endereço+rede). |
+| `config.rs` | `Config` persistida (JSON), `Favorite`, `Recent` (últimos acessos), `TrustedDevice`, `close_to_tray` (fechar esconde na bandeja; padrão `true`), pastas (`config_dir`, `service_dir`), autostart. |
 | `hostrun.rs` | **O laço de host compartilhado** pela GUI e pelo worker do serviço: aceita LAN (TCP 9000) + P2P, e atende **uma conexão por vez** com as regras atuais (`HostSettings`); mantém o registro no diretório (`spawn_directory`). |
 | `worker.rs` | Host "headless" (`run_headless`): o que o serviço executa. Relê a configuração **a cada conexão**. |
 | `ipc.rs` | IPC local GUI ↔ worker (`127.0.0.1:47199`, JSON por linha). |
 | `service.rs` | (Windows) instalar/desinstalar o serviço `EloHost`; supervisor do worker. |
+| `install.rs` | (Windows) instalação "um clique" do app (distinta do serviço). `elevate_install`/`elevate_uninstall` relançam o Elo elevado (UAC) nos modos `--install-app`/`--uninstall-app`: copiam o exe para `C:\Program Files\Elo\elo.exe`, criam a tarefa agendada `Elo` (`schtasks … /SC ONLOGON /RL HIGHEST`, inicia no logon como admin em `--tray`) e um atalho no Menu Iniciar; desinstalar remove tarefa, atalho e pasta (laço de ~60 s para apagar a pasta depois que o app aberto fecha). `is_installed`/`installed_exe`/`install_dir` para a UI. Fora do Windows, no-op/stub. |
+| `defender.rs` | (Windows) ajuda opcional para o falso positivo do Defender: lê as exclusões e, se o exe não estiver excluído, oferece adicionar via UAC ou o comando manual. Ver `docs/seguranca.md`. |
 | `events.rs` | `UiEvent` (eventos do host entregues à UI) e `HostCtl` (controlar a sessão: local ou remoto via IPC). |
 | `logging.rs` | Logs em arquivo diário + buffer em memória. |
-| `ui_home.rs` | Barra lateral, faixa de sessão, páginas Início e Favoritos. |
+| `ui_home.rs` | Barra lateral, faixa de sessão (com **Enviar arquivo** ao controlador, via `rfd`), páginas Início e Favoritos, seções **Dispositivos na rede** (descoberta na LAN, com **Atualizar** que recria `discovery::listen`) e **Últimos acessos** (recentes, com **Favoritar**), marcador **Continuar na bandeja ao fechar a janela**. |
 | `ui_settings.rs` | Configurações (Geral, Segurança, Conexão, Serviço, Logs, Sobre). |
-| `ui_session.rs` | Sessão de controle (tela remota, barra de ferramentas, input, arquivos). |
+| `ui_session.rs` | Sessão de controle (tela remota, barra de ferramentas, input, arquivos; botão **Manter no topo** → `ViewportCommand::WindowLevel`, campo `App.always_on_top`). |
+| `ui_manual.rs` | Página **Manual** (`pub fn manual_page(ui, pal)`): guia de uso de ponta a ponta; só depende de `ui`/`Palette`. |
+| `tray.rs` | (Windows) ícone na bandeja via `Shell_NotifyIconW` numa thread com janela *message-only* e laço `GetMessageW`; menu **Abrir Elo**/**Sair**. `start(tooltip, wake: egui::Context) -> (Tray, Receiver<TrayEvent>)`; a thread da bandeja chama `wake.request_repaint()` ao emitir um evento, para que o `update()` processe "Abrir"/"Sair" mesmo com a janela escondida. `enum TrayEvent { Open, Quit }`. Em não-Windows, stubs no-op. Só no modo GUI normal. |
 | `theme.rs`, `keymap.rs`, `logo_pixels.rs` | Tema/componentes, tabela egui→VK, ícone. |
+
+A bandeja (`tray.rs`) usa o crate `windows` 0.58 com as features `Win32_System_LibraryLoader` e `Win32_Graphics_Gdi`
+(além das já existentes, Shell/WindowsAndMessaging), adicionadas ao `Cargo.toml` do `elo-gui`.
 
 ### Host compartilhado (`hostrun.rs`)
 

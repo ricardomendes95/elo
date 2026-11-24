@@ -14,11 +14,12 @@ Todo o núcleo independente de plataforma é testado no Linux:
 cargo test
 ```
 
-Cobre 37 testes (no estado atual): protocolo, sessão (handshake + framing + concorrência), codecs (tiles e
-H.264), TOTP (vetores da RFC 6238), DSP de áudio, transferência, relay (e2e), configuração da GUI e o **teste full-stack** em
+Cobre 41 testes (no estado atual): protocolo, sessão (handshake + framing + concorrência), codecs (tiles e
+H.264), TOTP (vetores da RFC 6238), DSP de áudio, transferência, descoberta na LAN (parse de anúncio), relay (e2e),
+decisão de acesso (aprovação, pareamento, 2FA, kick), o modo `raw_media` do controller (usado pelo app Android) e o **teste full-stack** em
 `crates/client-core/src/e2e_tests.rs` — sobe um relay real, dois clientes,
 tela sintética e injetor gravado, e confere que frame, input, chat e um arquivo
-chegam de ponta a ponta.
+chegam de ponta a ponta. Os 3 testes de configuração da GUI rodam com `cargo test -p elo-gui`.
 
 > O H.264 usa o **OpenH264 compilado do código-fonte** (crate `openh264`), então o primeiro build precisa de
 > um compilador C/C++ (no Windows, as Visual C++ Build Tools; no Linux, `gcc`/`g++`).
@@ -101,3 +102,18 @@ elo-client connect --p2p ENDEREÇO_OU_ID [--directory HOST:PORTA] [--password PW
   (a CLI `host --p2p` não tem aprovador; só o app com GUI tem). `--code` é o código 2FA.
 - O controller da CLI é headless (imprime estatísticas de quadros e repassa o stdin como chat).
 - O host da CLI usa permissões completas, 30 fps e salva arquivos recebidos na pasta atual.
+
+## App Android
+
+O app Android (controller) é construído com `cargo-ndk` + Gradle; instruções completas, pré-requisitos e como
+testar no emulador contra o host de teste estão em [android.md](android.md#build). Resumo:
+
+```sh
+cd android
+./gradlew assembleDebug    # compila crates/android para arm64-v8a, gera os bindings UniFFI e o APK
+# -> android/app/build/outputs/apk/debug/app-debug.apk
+
+# host de teste (tela sintética) para o emulador, que conecta em 10.0.2.2:
+cargo run --release -p elo-client-core --example mock_host
+```
+

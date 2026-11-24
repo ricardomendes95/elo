@@ -18,6 +18,18 @@ pub struct Favorite {
     pub password: String,
 }
 
+/// A recently accessed computer (controller side), kept for one-click
+/// reconnection. Like a favorite but managed automatically on each connect.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Recent {
+    pub name: String,
+    pub address: String,
+    /// true = LAN (IP), false = Internet (P2P node id / short id).
+    pub lan: bool,
+    /// Saved password (may be empty — then the user types it on reconnect).
+    pub password: String,
+}
+
 /// A paired (trusted) device: connects without password or approval.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TrustedDevice {
@@ -72,6 +84,10 @@ pub struct Config {
     // ---- general ----
     #[serde(default)]
     pub autostart: bool,
+    /// Fechar a janela esconde o app na bandeja (mantém a conexão/host vivos)
+    /// em vez de encerrar. Ligado por padrão, no estilo do AnyDesk.
+    #[serde(default = "yes")]
+    pub close_to_tray: bool,
     /// UI theme: "dark" or "light".
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -87,6 +103,13 @@ pub struct Config {
     /// Saved connections.
     #[serde(default)]
     pub favorites: Vec<Favorite>,
+    /// Recently accessed computers (newest first), maintained on each connect.
+    #[serde(default)]
+    pub recents: Vec<Recent>,
+    /// O aviso do Windows Defender já foi atendido (exceção adicionada) ou
+    /// dispensado pelo usuário; quando true, não aparece mais.
+    #[serde(default)]
+    pub defender_hidden: bool,
 }
 
 fn default_theme() -> String {

@@ -15,8 +15,10 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod config;
+mod defender;
 mod events;
 mod hostrun;
+mod install;
 mod ipc;
 mod keymap;
 mod logging;
@@ -24,13 +26,16 @@ mod logo_pixels;
 #[cfg(windows)]
 mod service;
 mod theme;
+mod tray;
 mod ui_home;
+mod ui_manual;
 mod ui_session;
 mod ui_settings;
 mod worker;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{mpsc as smpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,7 +45,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use elo_client_core::controller::{ConnectOptions, ControllerEvent, ControllerHandle, ERR_2FA_REQUIRED};
+use elo_client_core::discovery::{Announcer, DiscoveryHandle};
 use elo_client_core::host::{ApproveFn, EventFn};
+use elo_client_core::HostLink;
 
 use config::{Config, TrustedDevice};
 use events::{HostCtl, UiEvent};
@@ -67,7 +74,26 @@ fn main() -> anyhow::Result<()> {
         if args.iter().any(|a| a == "--uninstall-service") {
             return service::uninstall();
         }
+        // Instalação/desinstalação no Windows: rodam ELEVADAS (relançadas via
+        // UAC) e NÃO abrem janela.
+        if args.iter().any(|a| a == "--install-app") {
+            install::run_install();
+            return Ok(());
+        }
+        if args.iter().any(|a| a == "--uninstall-app") {
+            install::run_uninstall();
+            return Ok(());
+        }
+        // Instância única: só para o modo GUI normal (e `--tray`, que é GUI). Se
+        // já houver uma instância, traz a janela existente para frente e sai.
+        if !acquire_single_instance() {
+            return Ok(());
+        }
     }
+
+    // `--tray`: inicia minimizado na bandeja (janela escondida). O ícone da
+    // bandeja é criado normalmente e "Abrir Elo" mostra a janela.
+    let start_hidden = std::env::args().any(|a| a == "--tray");
 
     logging::init(&config::config_dir());
     let icon = egui::IconData { rgba: logo_pixels::render_icon(64), width: 64, height: 64 };
@@ -76,11 +102,84 @@ fn main() -> anyhow::Result<()> {
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([900.0, 600.0])
             .with_title("Elo")
+            .with_visible(!start_hidden)
             .with_icon(Arc::new(icon)),
         ..Default::default()
     };
-    eframe::run_native("elo", options, Box::new(|_cc| Ok(Box::new(App::new()))))
+    eframe::run_native("elo", options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))))
         .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))
+}
+
+/// Acha o `HWND` da janela principal desta thread (a do eframe/winit). As
+/// janelas auxiliares e message-only do winit não têm `WS_CAPTION`; a janela
+/// real do app (título "Elo") tem. Devolve 0 se não achar.
+#[cfg(windows)]
+fn find_main_window() -> isize {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumThreadWindows, GetWindowLongPtrW, GWL_STYLE, WS_CAPTION,
+    };
+
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let out = &mut *(lparam.0 as *mut isize);
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        if style & WS_CAPTION.0 == WS_CAPTION.0 {
+            *out = hwnd.0 as isize;
+            return BOOL(0); // achou: para a enumeração
+        }
+        BOOL(1) // continua
+    }
+
+    let mut found: isize = 0;
+    unsafe {
+        let _ = EnumThreadWindows(
+            GetCurrentThreadId(),
+            Some(cb),
+            LPARAM(&mut found as *mut isize as isize),
+        );
+    }
+    found
+}
+
+/// Stub fora do Windows: nunca há HWND a descobrir.
+#[cfg(not(windows))]
+fn find_main_window() -> isize {
+    0
+}
+
+/// Instância única (modo GUI). Cria um mutex nomeado por máquina/sessão; se já
+/// existe outra instância, traz a janela "Elo" dela para frente e devolve
+/// `false` (o chamador deve encerrar sem abrir uma segunda janela). Devolve
+/// `true` quando esta é a primeira instância; nesse caso o handle do mutex é
+/// vazado de propósito para permanecer vivo por todo o processo.
+#[cfg(windows)]
+fn acquire_single_instance() -> bool {
+    use windows::core::w;
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SetForegroundWindow, ShowWindow, SW_SHOW,
+    };
+    unsafe {
+        let handle = CreateMutexW(None, true, w!("Local\\EloApp_Singleton"));
+        let already = GetLastError() == ERROR_ALREADY_EXISTS;
+        if already {
+            // Já há uma instância: traz a janela dela para frente e desiste.
+            if let Ok(h) = FindWindowW(None, w!("Elo")) {
+                if !h.0.is_null() {
+                    let _ = ShowWindow(h, SW_SHOW);
+                    let _ = SetForegroundWindow(h);
+                }
+            }
+            return false;
+        }
+        // Primeira instância: mantém o mutex vivo pelo resto do processo.
+        if let Ok(h) = handle {
+            std::mem::forget(h);
+        }
+        true
+    }
 }
 
 pub fn download_dir() -> PathBuf {
@@ -174,6 +273,14 @@ pub enum View {
     Home,
     Favorites,
     Settings,
+    Manual,
+}
+
+/// Which saved connection is being renamed in-place (name only).
+#[derive(PartialEq, Clone, Copy)]
+pub enum RenameTarget {
+    Favorite(usize),
+    Recent(usize),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -259,14 +366,48 @@ pub struct App {
     pub need_2fa: bool,
     pub twofa_code: String,
 
-    // Favorites presence (address -> online).
+    // Favorites/recents presence (address -> online).
     pub presence: Arc<Mutex<HashMap<String, bool>>>,
 
+    // In-place rename state for favorites/recents.
+    pub rename: Option<RenameTarget>,
+    pub rename_buf: String,
+
+    // LAN discovery: devices seen on the network, and our own announcement
+    // (kept alive while this machine hosts).
+    pub discovery: Option<DiscoveryHandle>,
+    pub announcer: Option<Announcer>,
+
+    // Live link to the connected controller (host side), for sending files to
+    // it. The host loop fills it with `Some` while a controller is connected.
+    pub host_link: Arc<Mutex<Option<HostLink>>>,
+
     pub enroll: Option<Enroll>,
+
+    // Ajuda do Defender: `None` = ainda verificando, `Some(true/false)` = já sabe
+    // se este exe está excluído. Preenchido por uma thread em segundo plano.
+    pub defender_excluded: Arc<Mutex<Option<bool>>>,
+    pub defender_dismissed: bool,
+    pub defender_show_manual: bool,
+
+    // Bandeja do sistema (estilo AnyDesk): o app continua rodando ao fechar a
+    // janela. `tray` remove o ícone no Drop; `tray_rx` entrega cliques/menu.
+    pub tray: Option<tray::Tray>,
+    pub tray_rx: Option<smpsc::Receiver<tray::TrayEvent>>,
+    /// Verdadeiro só quando o usuário escolheu "Sair" (fecha de verdade).
+    /// Compartilhado com a thread da bandeja, que o liga via Win32 ao sair.
+    pub really_quit: Arc<AtomicBool>,
+    /// `HWND` da janela principal (0 até ser descoberto em `update`),
+    /// compartilhado com a bandeja para controlá-la diretamente pelo Win32.
+    pub main_hwnd: Arc<AtomicIsize>,
+    /// Já avisamos uma vez que o app ficou na bandeja ao fechar.
+    pub tray_notice_shown: bool,
+    /// Mantém a janela sempre no topo durante uma sessão de controle.
+    pub always_on_top: bool,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(egui_ctx: &egui::Context) -> Self {
         let mut config = Config::load();
         if config.short_id.len() != 9 {
             use rand::Rng;
@@ -290,6 +431,21 @@ impl App {
         };
         let (ui_tx, ui_rx) = smpsc::channel();
         let light = config.theme == "light";
+        // Ícone na bandeja: se falhar, o app segue sem ele. O contexto do egui
+        // é passado para a thread da bandeja acordar o `update()` (via
+        // `request_repaint`) quando o usuário clica/escolhe algo com a janela
+        // escondida — senão o evento "Sair"/"Abrir" ficaria sem ser lido.
+        // Compartilhados com a thread da bandeja ANTES de iniciá-la: o HWND da
+        // janela principal (descoberto depois, em `update`) e o flag de "sair".
+        let main_hwnd = Arc::new(AtomicIsize::new(0));
+        let really_quit = Arc::new(AtomicBool::new(false));
+        let (tray, tray_rx) = match tray::start("Elo", egui_ctx.clone(), main_hwnd.clone(), really_quit.clone()) {
+            Ok((t, rx)) => (Some(t), Some(rx)),
+            Err(e) => {
+                tracing::warn!(error = %e, "bandeja do sistema indisponível");
+                (None, None)
+            }
+        };
         App {
             rt: Runtime::new().expect("tokio runtime"),
             pal: palette(light),
@@ -320,7 +476,66 @@ impl App {
             need_2fa: false,
             twofa_code: String::new(),
             presence: Arc::new(Mutex::new(HashMap::new())),
+            rename: None,
+            rename_buf: String::new(),
+            discovery: None,
+            announcer: None,
+            host_link: Arc::new(Mutex::new(None)),
             enroll: None,
+            defender_excluded: {
+                let cell = Arc::new(Mutex::new(None));
+                defender::spawn_check(cell.clone());
+                cell
+            },
+            defender_dismissed: false,
+            defender_show_manual: false,
+            tray,
+            tray_rx,
+            really_quit,
+            main_hwnd,
+            tray_notice_shown: false,
+            always_on_top: false,
+        }
+    }
+
+    /// Processa cliques/menu da bandeja: mostrar a janela ou sair de verdade.
+    fn drain_tray(&mut self, ctx: &egui::Context) {
+        let mut events = Vec::new();
+        if let Some(rx) = &self.tray_rx {
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+        }
+        for ev in events {
+            match ev {
+                tray::TrayEvent::Open => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                tray::TrayEvent::Quit => {
+                    self.really_quit.store(true, Ordering::SeqCst);
+                    // Mostra a janela antes de fechar: fechar uma janela escondida
+                    // pode não encerrar o loop em alguns casos. (Backup do canal; a
+                    // garantia é o `WM_CLOSE` direto que a bandeja já postou.)
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    /// Intercepta o fechar da janela: com "fechar para a bandeja" ligado e um
+    /// ícone de bandeja disponível, apenas esconde a janela (a conexão/host
+    /// continuam vivos) em vez de sair. "Sair" pela bandeja ignora isto.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        let closing = ctx.input(|i| i.viewport().close_requested());
+        if closing && !self.really_quit.load(Ordering::SeqCst) && self.config.close_to_tray && self.tray.is_some() && cfg!(windows) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if !self.tray_notice_shown {
+                self.tray_notice_shown = true;
+                self.toast("O Elo continua rodando na bandeja.");
+            }
         }
     }
 
@@ -358,6 +573,18 @@ impl App {
         let node_slot = self.node.clone();
         let status = self.host_status.clone();
 
+        // LAN discovery: listen for other devices and announce ourselves while
+        // we host. Needs the tokio runtime context.
+        let disp = if self.config.display_name.trim().is_empty() { config::computer_name() } else { self.config.display_name.clone() };
+        {
+            let _g = self.rt.enter();
+            match elo_client_core::discovery::listen() {
+                Ok(h) => self.discovery = Some(h),
+                Err(e) => tracing::warn!(error = %e, "descoberta na LAN indisponível"),
+            }
+            self.announcer = Some(elo_client_core::discovery::start(disp, self.my_short_id.clone(), DIRECT_PORT));
+        }
+
         if self.service_mode {
             *status.lock().unwrap() = "online — serviço do Windows (funciona com a tela bloqueada)".into();
             ipc::spawn_gui_server(&self.rt, config::service_dir(), self.ui_tx.clone());
@@ -373,6 +600,7 @@ impl App {
             let live = self.live.clone();
             let pw = self.session_password.clone();
             let ui_tx = self.ui_tx.clone();
+            let link_out = self.host_link.clone();
             let online = format!("online — LAN {}:{DIRECT_PORT} · Internet pronto", self.my_lan);
             let directory = self.config.directory.clone();
             let short = self.my_short_id.clone();
@@ -424,6 +652,7 @@ impl App {
                     status,
                     online_text: online,
                     after_session,
+                    link_out: Some(link_out),
                 })
                 .await;
             });
@@ -439,26 +668,33 @@ impl App {
         self.rt.spawn(async move {
             tokio::time::sleep(Duration::from_secs(4)).await;
             loop {
-                let (favs, dir) = {
+                // Favorites + recents, deduplicated by address.
+                let (targets, dir) = {
                     let c = live.lock().unwrap();
-                    (c.favorites.clone(), c.directory.clone())
+                    let mut t: Vec<(String, bool)> = c.favorites.iter().map(|f| (f.address.clone(), f.lan)).collect();
+                    for r in &c.recents {
+                        if !t.iter().any(|(a, _)| a == &r.address) {
+                            t.push((r.address.clone(), r.lan));
+                        }
+                    }
+                    (t, c.directory.clone())
                 };
                 let n = node.lock().unwrap().clone();
-                for f in favs {
-                    let online = if f.lan {
-                        let addr = if f.address.contains(':') { f.address.clone() } else { format!("{}:{DIRECT_PORT}", f.address) };
+                for (address, lan) in targets {
+                    let online = if lan {
+                        let addr = if address.contains(':') { address.clone() } else { format!("{}:{DIRECT_PORT}", address) };
                         matches!(tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr)).await, Ok(Ok(_)))
                     } else {
-                        let digits: String = f.address.chars().filter(|c| c.is_ascii_digit()).collect();
+                        let digits: String = address.chars().filter(|c| c.is_ascii_digit()).collect();
                         if digits.len() == 9 && !dir.trim().is_empty() {
                             elo_client_core::rendezvous::resolve_directory(&dir, &digits).await.is_ok()
                         } else if let Some(n) = &n {
-                            n.ping(&f.address, Duration::from_secs(8)).await
+                            n.ping(&address, Duration::from_secs(8)).await
                         } else {
                             false
                         }
                     };
-                    presence.lock().unwrap().insert(f.address.clone(), online);
+                    presence.lock().unwrap().insert(address.clone(), online);
                 }
                 tokio::time::sleep(Duration::from_secs(45)).await;
             }
@@ -476,7 +712,7 @@ impl App {
         };
         let password = self.remote_password.clone();
         let name = if self.config.display_name.trim().is_empty() { config::current_username() } else { self.config.display_name.clone() };
-        let opts = ConnectOptions { name: Some(name), totp_code: code };
+        let opts = ConnectOptions { name: Some(name), totp_code: code, ..Default::default() };
         let target = self.remote_addr.trim().to_string();
         let (tx, rx) = smpsc::channel::<ConnectResult>();
         tracing::info!(%target, lan = self.mode_lan, "conectando");
@@ -528,6 +764,44 @@ impl App {
         self.remote_password = fav.password.clone();
         self.mode_lan = fav.lan;
         self.start_connect(None);
+    }
+
+    /// Upsert a recent on a successful controller connection: dedup by address,
+    /// newest first, capped at 10. Keeps an existing (possibly renamed) name,
+    /// else the matching favorite's name, else the address itself.
+    fn record_recent(&mut self, address: &str, lan: bool, password: String) {
+        let addr = address.trim().to_string();
+        if addr.is_empty() {
+            return;
+        }
+        let mut cfg = self.config.clone();
+        let name = cfg
+            .recents
+            .iter()
+            .find(|r| r.address == addr)
+            .map(|r| r.name.clone())
+            .or_else(|| cfg.favorites.iter().find(|f| f.address == addr).map(|f| f.name.clone()))
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| addr.clone());
+        cfg.recents.retain(|r| r.address != addr);
+        cfg.recents.insert(0, config::Recent { name, address: addr, lan, password });
+        cfg.recents.truncate(10);
+        self.draft.recents = cfg.recents.clone();
+        self.save_config(cfg);
+    }
+
+    /// Adiciona um favorito evitando duplicar por `address` + `lan`. Retorna
+    /// `true` se adicionou, `false` se já existia um favorito equivalente.
+    pub fn add_favorite_unique(&mut self, name: String, address: String, lan: bool, password: String) -> bool {
+        let addr = address.trim().to_string();
+        if addr.is_empty() || self.config.favorites.iter().any(|f| f.address == addr && f.lan == lan) {
+            return false;
+        }
+        let mut cfg = self.config.clone();
+        cfg.favorites.push(config::Favorite { name, address: addr, lan, password });
+        self.draft.favorites = cfg.favorites.clone();
+        self.save_config(cfg);
+        true
     }
 
     pub fn save_favorite(&mut self) {
@@ -593,6 +867,7 @@ impl App {
         self.conn = match result {
             Ok((handle, events, label)) => {
                 tracing::info!(target = %label, "sessão de controle iniciada");
+                self.record_recent(&label, self.mode_lan, self.remote_password.clone());
                 Conn::Active(Box::new(Session::new(handle, events, label)))
             }
             Err(e) if e.contains(ERR_2FA_REQUIRED) => {
@@ -682,6 +957,89 @@ impl App {
             }
             Some(false) => self.need_2fa = false,
             None => {}
+        }
+    }
+
+    /// Aviso opcional do Windows Defender: só aparece quando a verificação já
+    /// terminou e este exe NÃO está excluído. Explica a situação e oferece o
+    /// atalho (UAC) e o caminho manual. Em outros sistemas nunca aparece.
+    fn defender_modal(&mut self, ctx: &egui::Context) {
+        if self.defender_dismissed || self.config.defender_hidden {
+            return;
+        }
+        let excluded = *self.defender_excluded.lock().unwrap();
+        if excluded != Some(false) {
+            return; // ainda verificando, já excluído, ou não foi possível checar
+        }
+        let pal = self.pal;
+        let mut add = false;
+        let mut dismiss = false;
+        modal(ctx, &pal, "defender", |ui| {
+            ui.set_max_width(460.0);
+            ui.label(egui::RichText::new("Windows Defender pode bloquear o Elo").size(18.0).strong().color(pal.text));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(
+                "O Elo ainda não tem assinatura de código. Por isso o Windows Defender \
+                 pode marcá-lo como falso positivo e até removê-lo do computador. \
+                 Adicionar uma exceção para o Elo evita isso até a assinatura ficar pronta.",
+            ).color(pal.muted));
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(
+                "Adicionar exceção é uma função oficial do Windows e vai pedir confirmação \
+                 de administrador (UAC). A escolha é sua.",
+            ).size(12.0).color(pal.muted));
+
+            if self.defender_show_manual {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Para fazer à mão, rode num PowerShell como administrador:").size(12.0).color(pal.muted));
+                ui.add_space(4.0);
+                let mut cmd = defender::manual_command();
+                egui::Frame::none().fill(pal.surface).stroke(egui::Stroke::new(1.0_f32, pal.border)).rounding(6.0).inner_margin(egui::Margin::same(8.0)).show(ui, |ui| {
+                    ui.add(egui::TextEdit::multiline(&mut cmd).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(2));
+                });
+                if ui.small_button("Copiar comando").clicked() {
+                    ui.output_mut(|o| o.copied_text = defender::manual_command());
+                }
+            }
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, &pal, "  Adicionar exceção  ").clicked() {
+                    add = true;
+                }
+                if ui.add(egui::Button::new(if self.defender_show_manual { "Ocultar passos" } else { "Ver passos manuais" }).min_size(egui::vec2(130.0, 34.0))).clicked() {
+                    self.defender_show_manual = !self.defender_show_manual;
+                }
+                if ui.add(egui::Button::new("Agora não").min_size(egui::vec2(90.0, 34.0))).clicked() {
+                    dismiss = true;
+                }
+            });
+        });
+
+        if add {
+            match defender::request_exclusion() {
+                Ok(()) => {
+                    self.toasts.push(("Se você confirmou no UAC, a exceção foi adicionada.".into(), Instant::now()));
+                    // Re-verifica depois de alguns segundos; o painel some se der certo.
+                    *self.defender_excluded.lock().unwrap() = None;
+                    let cell = self.defender_excluded.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(3));
+                        defender::spawn_check(cell);
+                    });
+                    self.defender_dismissed = true;
+                    // Não mostrar de novo em execuções futuras.
+                    self.config.defender_hidden = true;
+                    self.config.save();
+                }
+                Err(e) => self.toasts.push((format!("Não foi possível adicionar a exceção: {e}"), Instant::now())),
+            }
+        }
+        if dismiss {
+            self.defender_dismissed = true;
+            // "Agora não" / ignorar: não aparece mais nas próximas execuções.
+            self.config.defender_hidden = true;
+            self.config.save();
         }
     }
 
@@ -826,8 +1184,18 @@ impl eframe::App for App {
         if !self.host_started {
             self.start_host();
         }
+        // Descobre o HWND da janela principal na primeira vez (aqui estamos na
+        // thread que a criou), e o compartilha com a bandeja via o Arc.
+        if self.main_hwnd.load(Ordering::SeqCst) == 0 {
+            let h = find_main_window();
+            if h != 0 {
+                self.main_hwnd.store(h, Ordering::SeqCst);
+            }
+        }
         self.pump_events();
         self.poll_connect();
+        self.drain_tray(ctx);
+        self.handle_close(ctx);
 
         if matches!(self.conn, Conn::Active(_)) {
             ui_session::drive_session(self, ctx);
@@ -838,6 +1206,7 @@ impl eframe::App for App {
         self.pointer_overlay(ctx);
         self.approval_modal(ctx);
         self.twofa_modal(ctx);
+        self.defender_modal(ctx);
         self.toasts_ui(ctx);
 
         if matches!(self.conn, Conn::Active(_) | Conn::Connecting(_)) || self.pointer.is_some() {

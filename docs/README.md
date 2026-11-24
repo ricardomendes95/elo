@@ -2,7 +2,7 @@
 
 Elo é um aplicativo **original** de acesso remoto (ver a tela e controlar outra
 máquina, com áudio, área de transferência, chat e transferência de arquivos), escrito em Rust. Entregue como
-**um único executável portátil** (`elo.exe`), sem instalador.
+**um único executável portátil** (`elo.exe`), sem instalador, e como **app Android** (controller; ver [android.md](android.md)).
 
 > Elo não é uma cópia, modificação nem burla de nenhum produto comercial. Usa as
 > mesmas APIs nativas do Windows que ferramentas do gênero usam (captura de tela
@@ -17,6 +17,7 @@ máquina, com áudio, área de transferência, chat e transferência de arquivos
 | [protocolo.md](protocolo.md) | Protocolo de fio **v2** + **formato binário exato** (framing, bincode, índices de variantes, exemplos de bytes), ordem do handshake, decisão de acesso, vídeo H.264, áudio, TOTP |
 | [p2p.md](p2p.md) | Transporte P2P pela internet via iroh (hole punching, `Node`, presença, ID curto) |
 | [acesso-nao-supervisionado.md](acesso-nao-supervisionado.md) | Regras de acesso, senha, aprovação, pareamento, 2FA, favoritos, autostart, serviço/tela bloqueada, campos do `config.json`, logs |
+| [android.md](android.md) | **App Android** (controller): estrutura, build (cargo-ndk + Gradle), telas, gestos, teclado, MediaCodec/AudioTrack, API UniFFI, testes e limites |
 | [porting-android.md](porting-android.md) | Guia para portar para Android/APK (núcleo Rust via NDK, `MediaCodec`, `AudioTrack`, `Char`, handshake v2) |
 | [seguranca.md](seguranca.md) | Modelo de segurança: Noise, pinagem, decisão de acesso, 2FA, limite de tentativas, limitações |
 | [referencia-funcoes.md](referencia-funcoes.md) | Referência de módulos e funções públicas por crate |

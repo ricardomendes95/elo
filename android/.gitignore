@@ -1,0 +1,10 @@
+local.properties
+.gradle/
+build/
+*.iml
+.idea/
+.kotlin/
+
+# Gerados por build-rust.sh (núcleo Rust e bindings UniFFI)
+app/src/main/jniLibs/
+app/src/main/java/io/github/ricardomendes95/elo/ffi/

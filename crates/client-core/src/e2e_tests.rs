@@ -206,7 +206,7 @@ mod access {
         code: Option<String>,
     ) -> anyhow::Result<(crate::controller::ControllerHandle, tokio::sync::mpsc::Receiver<ControllerEvent>)> {
         let s = TcpStream::connect(addr).await?;
-        let o = ConnectOptions { name: Some("Teste".into()), totp_code: code };
+        let o = ConnectOptions { name: Some("Teste".into()), totp_code: code, ..Default::default() };
         tokio::time::timeout(Duration::from_secs(10), connect_on_opts(s, kp, password, std::env::temp_dir(), o)).await?
     }
 
@@ -308,5 +308,48 @@ mod access {
             }
         }
         assert!(gone, "operator should be disconnected after a kick");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_media_hands_over_h264_and_close_disconnects() {
+        let mut o = opts();
+        o.open_access = true;
+        let addr = spawn_host(o).await;
+        let kp = elo_session::generate_keypair().unwrap();
+        let s = TcpStream::connect(&addr).await.unwrap();
+        let co = ConnectOptions { name: Some("Teste".into()), raw_media: true, ..Default::default() };
+        let (h, mut events) = connect_on_opts(s, &kp, "", std::env::temp_dir(), co).await.unwrap();
+
+        // The host encodes H.264 (this build has OpenH264): the controller must
+        // pass the Annex-B access unit through untouched, starting with an IDR.
+        let mut got = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap() {
+                ControllerEvent::FrameH264 { width, height, key, data } => {
+                    assert_eq!((width, height), (64, 48));
+                    assert!(key, "first access unit must be a keyframe");
+                    assert!(data.starts_with(&[0, 0, 0, 1]) || data.starts_with(&[0, 0, 1]), "Annex-B start code");
+                    got = true;
+                    break;
+                }
+                ControllerEvent::Frame { .. } => panic!("raw mode must not decode video"),
+                _ => continue,
+            }
+        }
+        assert!(got, "expected a raw H.264 frame");
+
+        h.close();
+        let mut gone = false;
+        for _ in 0..200 {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+                Ok(Some(ControllerEvent::Disconnected)) | Ok(None) => {
+                    gone = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(gone, "close() must end the session");
     }
 }

@@ -316,6 +316,13 @@ where
         self.write.flush().await?;
         Ok(())
     }
+
+    /// Close our direction of the stream (TCP FIN / QUIC stream finish), so
+    /// the peer sees end-of-stream and tears the session down.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.write.shutdown().await?;
+        Ok(())
+    }
 }
 
 /// The read half of a split [`EncryptedStream`].
