@@ -55,6 +55,10 @@ object Prefs {
     private val _keepScreenOn = MutableStateFlow(true)
     val keepScreenOn: StateFlow<Boolean> = _keepScreenOn.asStateFlow()
 
+    private val _hostPassword = MutableStateFlow("")
+    /** Senha opcional para quem se conecta a este celular (vazio = pedir aprovação). */
+    val hostPassword: StateFlow<String> = _hostPassword.asStateFlow()
+
     fun init(context: Context) {
         if (::sp.isInitialized) return
         sp = context.applicationContext.getSharedPreferences("elo", Context.MODE_PRIVATE)
@@ -66,6 +70,7 @@ object Prefs {
         _touchMode.value = sp.getString("touchMode", "direct") ?: "direct"
         _audioOnStart.value = sp.getBoolean("audioOnStart", true)
         _keepScreenOn.value = sp.getBoolean("keepScreenOn", true)
+        _hostPassword.value = sp.getString("hostPassword", "") ?: ""
     }
 
     fun setFavorites(list: List<Favorite>) {
@@ -128,6 +133,7 @@ object Prefs {
     fun setTheme(v: String) { _theme.value = v; sp.edit().putString("theme", v).apply() }
     fun setTouchMode(v: String) { _touchMode.value = v; sp.edit().putString("touchMode", v).apply() }
     fun setAudioOnStart(v: Boolean) { _audioOnStart.value = v; sp.edit().putBoolean("audioOnStart", v).apply() }
+    fun setHostPassword(v: String) { _hostPassword.value = v; sp.edit().putString("hostPassword", v).apply() }
     fun setKeepScreenOn(v: Boolean) { _keepScreenOn.value = v; sp.edit().putBoolean("keepScreenOn", v).apply() }
 
     private fun parseFavorites(s: String?): List<Favorite> = runCatching {

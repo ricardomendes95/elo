@@ -563,30 +563,82 @@ impl Capture for DxgiCapture {
 /// Injects remote input events into the local session via `SendInput`.
 /// Mouse coordinates are relative to the captured monitor (`set_area`) and
 /// are mapped onto the whole virtual desktop.
+///
+/// `SendInput` only reaches the input desktop if the *calling thread* is
+/// attached to it, and `SetThreadDesktop` fails on threads that own windows
+/// or hooks (tokio workers may, via clipboard/audio/COM). So every injection
+/// runs on one dedicated OS thread that never creates windows and follows the
+/// input desktop (Default <-> Winlogon) before each event.
 pub struct SendInputSink {
     area_x: i32,
     area_y: i32,
     area_w: u32,
     area_h: u32,
+    jobs: std_mpsc::Sender<InputJob>,
+}
+
+/// One batch of events for the input thread, plus where to report the result.
+struct InputJob {
+    inputs: Vec<INPUT>,
+    reply: std_mpsc::SyncSender<Result<()>>,
+}
+
+// SAFETY: INPUT is plain data (no pointers; `dwExtraInfo` is an integer).
+unsafe impl Send for InputJob {}
+
+/// Body of the dedicated input thread.
+fn input_thread(jobs: std_mpsc::Receiver<InputJob>) {
+    let mut warned = false;
+    for job in jobs {
+        // Follow the secure desktop (lock screen / UAC) when privileged.
+        ensure_input_desktop();
+        let mut result = Ok(());
+        for input in &job.inputs {
+            // SAFETY: `input` is a fully-initialized INPUT; cbsize matches.
+            let sent = unsafe { SendInput(std::slice::from_ref(input), std::mem::size_of::<INPUT>() as i32) };
+            if sent != 1 {
+                let err = windows::core::Error::from_win32();
+                let desk = CURRENT_DESKTOP.with(|c| c.borrow().as_ref().map(|(_, n)| n.clone()));
+                if !warned {
+                    tracing::warn!(error = %err, desktop = ?desk, "SendInput falhou; o thread de input não está no desktop de entrada");
+                    warned = true;
+                }
+                // Drop our cached desktop so the next event retries the switch.
+                // (Forget its name; the handle is closed after the next switch.)
+                CURRENT_DESKTOP.with(|c| {
+                    if let Some((_, name)) = c.borrow_mut().as_mut() {
+                        name.clear();
+                    }
+                });
+                result = Err(anyhow!("SendInput injected 0/1 events ({err}; desktop {desk:?})"));
+                break;
+            }
+        }
+        if result.is_ok() {
+            warned = false;
+        }
+        let _ = job.reply.send(result);
+    }
 }
 
 impl SendInputSink {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { area_x: 0, area_y: 0, area_w: width.max(1), area_h: height.max(1) }
+        let (tx, rx) = std_mpsc::channel::<InputJob>();
+        if let Err(e) = std::thread::Builder::new().name("elo-input".into()).spawn(move || input_thread(rx)) {
+            tracing::warn!(error = %e, "não foi possível criar o thread de input");
+        }
+        Self { area_x: 0, area_y: 0, area_w: width.max(1), area_h: height.max(1), jobs: tx }
     }
 
-    /// Send a single prepared `INPUT` on the current input desktop.
+    /// Send prepared `INPUT`s on the current input desktop (via the input thread).
+    fn send_all(&self, inputs: Vec<INPUT>) -> Result<()> {
+        let (reply, done) = std_mpsc::sync_channel(1);
+        self.jobs.send(InputJob { inputs, reply }).map_err(|_| anyhow!("input thread is gone"))?;
+        done.recv_timeout(Duration::from_secs(2)).map_err(|_| anyhow!("input thread did not answer"))?
+    }
+
     fn send(&self, input: INPUT) -> Result<()> {
-        // Follow the secure desktop (lock screen / UAC) when privileged.
-        ensure_input_desktop();
-        // SAFETY: `input` is a fully-initialized INPUT; cbsize matches. The
-        // array lives for the duration of the call.
-        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-        if sent == 1 {
-            Ok(())
-        } else {
-            bail!("SendInput injected {sent}/1 events (blocked by UIPI?)");
-        }
+        self.send_all(vec![input])
     }
 
     fn mouse(dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
@@ -670,19 +722,19 @@ impl InputSink for SendInputSink {
                 // independent of the host's keyboard layout.
                 let Some(ch) = char::from_u32(code) else { return Ok(()) };
                 let mut units = [0u16; 2];
+                let mut inputs = Vec::with_capacity(4);
                 for &u in ch.encode_utf16(&mut units).iter() {
                     for up in [false, true] {
                         let flags = if up { KEYEVENTF_UNICODE | KEYEVENTF_KEYUP } else { KEYEVENTF_UNICODE };
-                        let input = INPUT {
+                        inputs.push(INPUT {
                             r#type: INPUT_KEYBOARD,
                             Anonymous: INPUT_0 {
                                 ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0), wScan: u, dwFlags: flags, time: 0, dwExtraInfo: 0 },
                             },
-                        };
-                        self.send(input)?;
+                        });
                     }
                 }
-                Ok(())
+                self.send_all(inputs)
             }
         }
     }
@@ -695,20 +747,86 @@ impl InputSink for SendInputSink {
     }
 
     fn send_sas(&mut self) -> Result<()> {
-        // SAFETY: load sas.dll and resolve SendSAS by name; the module is
-        // freed after the call.
-        unsafe {
-            let module = LoadLibraryW(w!("sas.dll")).context("sas.dll is not available")?;
-            let Some(proc_addr) = GetProcAddress(module, s!("SendSAS")) else {
-                let _ = FreeLibrary(module);
-                bail!("SendSAS not found in sas.dll");
-            };
-            // SendSAS: VOID WINAPI SendSAS(BOOL AsUser).
-            let send_sas: unsafe extern "system" fn(BOOL) = std::mem::transmute(proc_addr);
-            // FALSE = act as a service (requires SYSTEM + SoftwareSASGeneration).
-            send_sas(BOOL(0));
-            let _ = FreeLibrary(module);
+        // SendSAS only works from the service process itself (session 0), not
+        // from the SYSTEM worker in the user's session: ask the service via a
+        // named event. Without the service, try locally (usually a no-op).
+        if signal_service_sas() {
+            return Ok(());
         }
-        Ok(())
+        send_sas_now()
+    }
+}
+
+// ===========================================================================
+// Ctrl+Alt+Del through the service
+// ===========================================================================
+
+/// Named event the service waits on; the session worker sets it to request
+/// Ctrl+Alt+Del.
+const SAS_EVENT: windows::core::PCWSTR = w!("Global\\EloSendSas");
+
+/// Call `SendSAS(FALSE)` in this process. Needs to run inside a service
+/// running as SYSTEM, with the `SoftwareSASGeneration` policy set.
+pub fn send_sas_now() -> Result<()> {
+    // SAFETY: load sas.dll and resolve SendSAS by name; the module is freed
+    // after the call.
+    unsafe {
+        let module = LoadLibraryW(w!("sas.dll")).context("sas.dll is not available")?;
+        let Some(proc_addr) = GetProcAddress(module, s!("SendSAS")) else {
+            let _ = FreeLibrary(module);
+            bail!("SendSAS not found in sas.dll");
+        };
+        // SendSAS: VOID WINAPI SendSAS(BOOL AsUser).
+        let send_sas: unsafe extern "system" fn(BOOL) = std::mem::transmute(proc_addr);
+        // FALSE = act as a service (requires SYSTEM + SoftwareSASGeneration).
+        send_sas(BOOL(0));
+        let _ = FreeLibrary(module);
+    }
+    Ok(())
+}
+
+/// Set the service's SAS event. `false` when no service is listening.
+fn signal_service_sas() -> bool {
+    use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+    // SAFETY: open by name; the handle is closed right after use.
+    unsafe {
+        let Ok(ev) = OpenEventW(EVENT_MODIFY_STATE, false, SAS_EVENT) else {
+            return false;
+        };
+        let ok = SetEvent(ev).is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(ev);
+        if ok {
+            tracing::info!("Ctrl+Alt+Del pedido ao serviço");
+        }
+        ok
+    }
+}
+
+/// Service side: create the SAS event and call `SendSAS` each time a session
+/// worker sets it. Runs on its own thread for the life of the service.
+pub fn spawn_sas_listener() {
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+    let spawned = std::thread::Builder::new().name("elo-sas".into()).spawn(|| {
+        // Auto-reset, initially unset. The default DACL of a SYSTEM service
+        // lets other SYSTEM processes (the session worker) open it.
+        // SAFETY: plain event creation; the handle lives as long as the thread.
+        let ev = match unsafe { CreateEventW(None, false, false, SAS_EVENT) } {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, "não foi possível criar o evento de Ctrl+Alt+Del");
+                return;
+            }
+        };
+        loop {
+            // SAFETY: waiting on our own live event handle.
+            unsafe { WaitForSingleObject(ev, INFINITE) };
+            match send_sas_now() {
+                Ok(()) => tracing::info!("Ctrl+Alt+Del enviado pelo serviço"),
+                Err(e) => tracing::warn!(error = %e, "Ctrl+Alt+Del falhou no serviço"),
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "não foi possível criar o thread de Ctrl+Alt+Del");
     }
 }

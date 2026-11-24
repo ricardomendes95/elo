@@ -59,7 +59,7 @@ Nada abaixo foi exercitado numa máquina Windows real com tela neste desenvolvim
       curto, senha/aprovação/2FA, H.264 via `MediaCodec`, áudio via `AudioTrack`, gestos (Direto/Touchpad, rolagem, zoom),
       teclado (`Char` + VK, teclas especiais), favoritos com presença, chat, envio de arquivo, área de transferência,
       multimonitor, Ctrl+Alt+Del. Verificado no emulador contra o `mock_host`; **falta testar num celular e num host Windows reais**.
-- [ ] **App Android — host** (compartilhar a tela do celular via `MediaProjection`; controle só com AccessibilityService).
+- [x] **App Android — host** ([android.md](android.md#host-no-android)): compartilha a tela (`MediaProjection`, quadros BGRA pelo codec de tiles) e recebe controle via AccessibilityService; **não verificado em celular real**.
 - [ ] App Android: serviço em primeiro plano para manter a sessão em segundo plano; build de release assinado.
 - [ ] PAKE (SPAKE2/OPAQUE) no lugar de `SHA256(salt‖senha)`.
 - [ ] Guardar senhas/segredo TOTP fora de texto claro (hoje em `config.json`).

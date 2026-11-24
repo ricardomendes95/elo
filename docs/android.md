@@ -1,10 +1,10 @@
 # App Android (controller)
 
-O app Android do Elo (`io.github.ricardomendes95.elo`, versão `0.1.0`) **vê e controla** um computador que roda o Elo
+O app Android do Elo (`io.github.ricardomendes95.elo`, versão `0.3.0`) **vê e controla** um computador que roda o Elo
 (`elo.exe`). Ele reaproveita o núcleo Rust (protocolo, Noise, P2P/iroh) compilado com o NDK — o "Caminho A" de
 [porting-android.md](porting-android.md) — e a interface é Kotlin + Jetpack Compose.
 
-O papel de **host** (compartilhar a tela do celular) ainda não existe; ver [Host no Android](#host-no-android-ainda-não-implementado).
+O papel de **host** (compartilhar a tela do celular, para um PC ver e controlar) existe desde a 0.3.0; ver [Host no Android](#host-no-android).
 
 ## Estrutura
 
@@ -132,8 +132,7 @@ app manda `Pointer { x, y }` (o host mostra o ponteiro) em vez de input. No Touc
   (`elo_client_core::discovery`, porta 9001) via o objeto `Discovery` do UniFFI e relê a lista a cada ~2 s.
   Receber broadcast UDP no Android exige segurar um `WifiManager.MulticastLock` enquanto a tela está aberta e a
   permissão **`CHANGE_WIFI_MULTICAST_STATE`** (declarada no `AndroidManifest.xml`). Só LAN/sub-rede.
-  - **Descoberta assimétrica (hoje):** só o host (Windows) se anuncia; o Android apenas **escuta** (não hospeda). Por isso
-    o celular encontra o PC, mas o PC **não** encontra o celular. A descoberta fica mútua quando o Android puder hospedar.
+  - Com o compartilhamento ligado, o celular também **se anuncia** na descoberta (`discovery::start`), então o PC o encontra.
 - Logs do núcleo: `files/elo-android.log`.
 
 ## API do núcleo (`elo-android`, via UniFFI)
@@ -186,16 +185,58 @@ internet.
 - Quando o host encerra a sessão, o app volta ao Início sem mostrar um aviso.
 - APK de debug (assinado com a chave de debug). Não há build de release assinado.
 
-## Host no Android (ainda não implementado)
+## Host no Android
 
-Plano e limites (fase 5):
+Com **Compartilhar esta tela** ligado (cartão na tela Início), o celular aceita conexões do Elo do PC (LAN TCP 9000 e
+P2P) e o PC vê e controla a tela. A GUI Windows não mudou.
 
-- **Captura**: `MediaProjection` → `VirtualDisplay` → encoder H.264 do `MediaCodec` (surface input), mandando
-  `FrameH264` Annex-B; exige consentimento do usuário **a cada sessão** e um serviço em primeiro plano do tipo
-  `mediaProjection` (`FOREGROUND_SERVICE_MEDIA_PROJECTION`) com notificação.
-- **Controle**: só via **AccessibilityService** (`dispatchGesture` para toques/arrastes, `performGlobalAction` para
-  Voltar/Início/Recentes). O usuário precisa ativar o serviço nas configurações de acessibilidade; não há como
-  injetar teclas arbitrárias nem `Char` em qualquer app (texto só em campos editáveis via
-  `AccessibilityNodeInfo.ACTION_SET_TEXT`), e a Play Store restringe esse uso. `INJECT_EVENTS` é só para apps de
-  sistema/root. Sem o serviço ativo, o host Android seria **somente visualização**.
-- **Áudio**: captura de áudio de reprodução (`AudioPlaybackCapture`, Android 10+) só pega apps que permitem; não implementado.
+### Como funciona
+
+- **Rust** (`crates/android/src/host.rs`): `Elo.startHost(name, password, listener)` sobe um loop igual ao do
+  `hostrun.rs` do desktop (LAN `0.0.0.0:9000` + `node.accept()` P2P, uma sessão por vez) com `serve_host_opts`,
+  anuncia na LAN, e usa uma chave Noise estável em `files/host.key` (ID curto de 9 dígitos derivado dela). Permissões:
+  só **controle** (sem arquivos, área de transferência ou áudio). Sem H.264 (`prefer_h264 = false`): o vídeo vai pelo
+  codec de tiles BGRA, 15 qps. Senha vazia = `on_approval` (bloqueia até o dono responder, ~2 min); com senha, não
+  há pedido de aprovação.
+- **Captura** (`host/HostService.kt`): consentimento do `MediaProjection` na UI → serviço em primeiro plano
+  (`foregroundServiceType="mediaProjection"`, notificação "Compartilhando a tela" com **Parar**) → `VirtualDisplay`
+  → `ImageReader` RGBA_8888 (lado maior ≤ 1280 px, ~15 qps, com envio final garantido para telas paradas) →
+  `Host.pushFrame(data, w, h, rowStride)` (converte para BGRA compacto e guarda o último quadro). Rotação recria
+  o leitor e redimensiona o `VirtualDisplay`; `MediaProjection.Callback.onStop` (obrigatório no Android 14+) desliga tudo.
+- **Controle** (`host/EloAccessibilityService.kt`): converte coordenadas do quadro para a tela real
+  (`x * larguraReal / larguraDoQuadro`). Clique = toque; botão esquerdo + movimento = arrasto (traços encadeados,
+  `willContinue`); botão direito = toque longo (650 ms); roda = deslizar; Esc = Voltar; Home = Início; Backspace remove o
+  último caractere do campo focado (campo vazio = Voltar); Enter = `ACTION_IME_ENTER` (API 30+); `Char` =
+  `ACTION_SET_TEXT` no campo focado, acrescentando ao texto. Sem o serviço ligado, a sessão é **só visualização**.
+- **UI**: cartão "Compartilhar esta tela" (liga/desliga, senha opcional salva em `Prefs.hostPassword`, ID P2P e IP da LAN
+  com copiar, estado da sessão, **Encerrar sessão**, botão para as configurações de acessibilidade) e diálogo de
+  aprovação em qualquer aba; com o app em segundo plano o pedido vira notificação com **Aceitar/Recusar**.
+
+### API UniFFI do host
+
+- `Elo.startHost(name, password, listener): Host` (bloqueante, `Dispatchers.IO`).
+- `Host`: `address()`, `pushFrame(data, width, height, rowStride)`, `endSession()`, `stop()`.
+- `HostListener` (threads de fundo): `onApproval(name, fingerprint): Boolean` (bloqueante), `onSessionStarted(peer)`,
+  `onSessionEnded()`, `onInput(ev: HostInput)`, `onStatus(text)`.
+- `HostInput`: `MouseMove{x,y}`, `MouseButton{button,down}`, `Scroll{dx,dy}`, `Key{code,down}` (VK Windows), `Char{code}`.
+
+### Como testar
+
+1. Instale o APK, abra o Elo, ligue **Compartilhar esta tela** e aceite a captura. Anote o IP da LAN (ou o ID P2P).
+2. Ligue o serviço **Elo: controle remoto** em Configurações > Acessibilidade (botão no cartão). Em Android 13+, apps
+   instalados fora da loja precisam antes de Informações do app > ⋮ > *Permitir configurações restritas*.
+3. No Elo do Windows, conecte em **Rede local → IP do celular** (ou o ID P2P) com a senha, ou sem senha e aceite o
+   pedido no celular. O celular também aparece em "Dispositivos na rede" do PC.
+4. Verifique: imagem, clique, arrastar, botão direito (toque longo), roda, Esc/Home, digitação num campo de texto,
+   rotação da tela, **Parar** na notificação e **Encerrar sessão**.
+
+### Limitações
+
+- **Não testado em celular real** (nem no emulador): o desenvolvimento não teve aparelho.
+- Controle limitado ao que acessibilidade permite: sem teclas arbitrárias (só Esc/Backspace/Home/Enter e texto em
+  campos editáveis), sem multitoque, sem Ctrl+Alt+Del; telas protegidas (`FLAG_SECURE`, senha, alguns bancos) saem
+  pretas e podem bloquear gestos. A Play Store restringe o uso de `AccessibilityService` para controle remoto.
+- Vídeo por tiles BGRA (sem H.264): usa mais banda que o host Windows; sem áudio, arquivos ou área de transferência.
+- O consentimento do `MediaProjection` é pedido a cada vez que se liga; o endereço P2P só aparece depois do nó iroh subir.
+- Não há registro no servidor de diretório (ID curto de 9 dígitos não resolve pelo diretório); use o ID P2P ou a LAN.
+- O arrasto longo envia traços de ~40 ms; apps muito sensíveis podem perceber pequenas pausas.

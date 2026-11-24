@@ -19,6 +19,9 @@ use elo_protocol::{InputEvent, MouseButton};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
+mod host;
+pub use host::{Host, HostInput, HostListener};
+
 uniffi::setup_scaffolding!();
 
 /// Porta padrão do host Elo para conexão direta na LAN (igual ao desktop).

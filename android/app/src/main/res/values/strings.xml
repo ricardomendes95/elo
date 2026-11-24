@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_label">Elo: controle remoto</string>
+    <string name="accessibility_service_description">Permite que o computador conectado ao Elo controle este celular: toques, arrastes, rolagem, botões Voltar e Início e digitação em campos de texto. Sem este serviço, o computador só consegue ver a tela. O Elo usa o serviço apenas durante uma sessão de compartilhamento iniciada por você.</string>
+</resources>

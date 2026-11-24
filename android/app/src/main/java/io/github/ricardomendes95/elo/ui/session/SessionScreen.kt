@@ -162,6 +162,7 @@ fun SessionScreen(active: ActiveSession, onExit: () -> Unit) {
     var infoOpen by remember { mutableStateOf(false) }
     var confirmExit by remember { mutableStateOf(false) }
     var monitorMenu by remember { mutableStateOf(false) }
+    var actionsMenu by remember { mutableStateOf(false) }
     var seenChat by remember { mutableIntStateOf(0) }
     var fps by remember { mutableIntStateOf(0) }
     var mods by remember { mutableStateOf<Map<Int, Boolean>>(emptyMap()) }
@@ -491,9 +492,32 @@ fun SessionScreen(active: ActiveSession, onExit: () -> Unit) {
                             }
                         }
                     }
-                    BarButton(Icons.Filled.PowerSettingsNew, "Ctrl+Alt+Del", false, enabled = canControl) {
-                        session.sendSas()
-                        Toast.makeText(context, "Ctrl+Alt+Del enviado (requer o serviço do Elo no Windows).", Toast.LENGTH_SHORT).show()
+                    Box {
+                        BarButton(Icons.Filled.PowerSettingsNew, "Comandos", actionsMenu, enabled = canControl) { actionsMenu = true }
+                        DropdownMenu(actionsMenu, onDismissRequest = { actionsMenu = false }) {
+                            DropdownMenuItem(
+                                text = { Text("Ctrl+Alt+Del") },
+                                onClick = {
+                                    actionsMenu = false
+                                    session.sendSas()
+                                    Toast.makeText(context, "Ctrl+Alt+Del enviado (requer o serviço do Elo no Windows).", Toast.LENGTH_SHORT).show()
+                                },
+                            )
+                            listOf(
+                                Triple("Gerenciador de Tarefas", "Ctrl+Shift+Esc", intArrayOf(Vk.CONTROL, Vk.SHIFT, Vk.ESCAPE)),
+                                Triple("Executar", "Win+R", intArrayOf(Vk.LWIN, 'R'.code)),
+                                Triple("Histórico da área de transferência", "Win+V", intArrayOf(Vk.LWIN, 'V'.code)),
+                                Triple("Captura de tela", "Win+Shift+S", intArrayOf(Vk.LWIN, Vk.SHIFT, 'S'.code)),
+                            ).forEach { (label, keys, vks) ->
+                                DropdownMenuItem(
+                                    text = { Text("$keys  ·  $label") },
+                                    onClick = {
+                                        actionsMenu = false
+                                        keyboard.combo(*vks)
+                                    },
+                                )
+                            }
+                        }
                     }
                     BarButton(if (audioOn) Icons.Filled.VolumeUp else Icons.Filled.VolumeOff, "Som", audioOn, enabled = info.audio) {
                         audioOn = !audioOn

@@ -5,6 +5,8 @@ import android.os.Build
 import io.github.ricardomendes95.elo.ffi.Discovery
 import io.github.ricardomendes95.elo.ffi.Elo
 import io.github.ricardomendes95.elo.ffi.EloException
+import io.github.ricardomendes95.elo.ffi.Host
+import io.github.ricardomendes95.elo.ffi.HostListener
 import io.github.ricardomendes95.elo.ffi.Monitor
 import io.github.ricardomendes95.elo.ffi.Session
 import io.github.ricardomendes95.elo.ffi.SessionInfo
@@ -57,6 +59,10 @@ object EloCore {
     suspend fun deviceId(): Result<String> = withContext(Dispatchers.IO) {
         runCatching { core().deviceId() }.mapError()
     }
+
+    /** Liga o papel de host (bloqueante: chame em `Dispatchers.IO`). */
+    fun startHost(name: String, password: String, listener: HostListener): Host =
+        core().startHost(name.ifBlank { defaultDeviceName() }, password, listener)
 
     /**
      * Cria um descobridor de hosts na LAN. Chame `start()` e leia `devices()`

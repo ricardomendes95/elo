@@ -190,6 +190,8 @@ fun HomeScreen() {
             onConnect = { d -> connect("${d.ip}:${d.port}", true, "", d.name) },
         )
 
+        ShareCard()
+
         DeviceCard()
 
         if (recents.isNotEmpty()) {
@@ -450,10 +452,6 @@ private fun DeviceCard() {
                 },
             ) { Icon(Icons.Filled.Share, null, Modifier.size(18.dp)); Spacer(Modifier.size(6.dp)); Text("Compartilhar") }
         }
-        Text(
-            "Para ser acessado por outro aparelho, use o Elo no computador; compartilhar a tela deste celular chega numa próxima versão.",
-            color = c.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp),
-        )
     }
 
     if (editName) {

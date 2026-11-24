@@ -363,6 +363,8 @@ pub struct App {
     pub mode_lan: bool,
     pub fav_name: String,
     pub conn: Conn,
+    /// Task of the pending connection (aborted by "Cancelar").
+    connect_abort: Option<tokio::task::AbortHandle>,
     pub need_2fa: bool,
     pub twofa_code: String,
 
@@ -473,6 +475,7 @@ impl App {
             mode_lan: false,
             fav_name: String::new(),
             conn: Conn::Idle,
+            connect_abort: None,
             need_2fa: false,
             twofa_code: String::new(),
             presence: Arc::new(Mutex::new(HashMap::new())),
@@ -721,10 +724,11 @@ impl App {
             use elo_client_core::controller::{run_controller_direct_opts, DirectControllerConfig};
             let host = if target.contains(':') { target.clone() } else { format!("{target}:{DIRECT_PORT}") };
             let cfg = DirectControllerConfig { host, keypair, password, download_dir: download_dir() };
-            self.rt.spawn(async move {
+            let task = self.rt.spawn(async move {
                 let r = run_controller_direct_opts(cfg, opts).await.map(|(h, e)| (h, e, target)).map_err(|e| format!("{e:#}"));
                 let _ = tx.send(r);
             });
+            self.connect_abort = Some(task.abort_handle());
         } else {
             let node = self.node.lock().unwrap().clone();
             let Some(node) = node else {
@@ -732,7 +736,7 @@ impl App {
                 return;
             };
             let directory = self.config.directory.trim().to_string();
-            self.rt.spawn(async move {
+            let task = self.rt.spawn(async move {
                 let res = async {
                     let digits: String = target.chars().filter(|c| c.is_ascii_digit()).collect();
                     let node_id = if digits.len() == 9 && target.len() <= 11 {
@@ -755,8 +759,20 @@ impl App {
                 .await;
                 let _ = tx.send(res);
             });
+            self.connect_abort = Some(task.abort_handle());
         }
         self.conn = Conn::Connecting(rx);
+    }
+
+    /// Abandon the pending connection (including a wait for approval).
+    pub fn cancel_connect(&mut self) {
+        if let Some(task) = self.connect_abort.take() {
+            task.abort();
+        }
+        if matches!(self.conn, Conn::Connecting(_)) {
+            tracing::info!("conexão cancelada pelo usuário");
+            self.conn = Conn::Idle;
+        }
     }
 
     pub fn start_connect_fav(&mut self, fav: &config::Favorite) {
@@ -864,6 +880,7 @@ impl App {
     fn poll_connect(&mut self) {
         let Conn::Connecting(rx) = &self.conn else { return };
         let Ok(result) = rx.try_recv() else { return };
+        self.connect_abort = None;
         self.conn = match result {
             Ok((handle, events, label)) => {
                 tracing::info!(target = %label, "sessão de controle iniciada");

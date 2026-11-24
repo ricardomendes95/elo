@@ -144,12 +144,16 @@ fn address_bar(app: &mut App, ui: &mut egui::Ui) {
                 .color(pal.muted),
         );
     });
+    let mut cancel = false;
     match &app.conn {
         Conn::Connecting(_) => {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(egui::RichText::new("conectando… (se pediu aprovação, aguarde o outro lado aceitar)").color(pal.muted));
+                if ui.button("Cancelar").clicked() {
+                    cancel = true;
+                }
             });
         }
         Conn::Failed(e) => {
@@ -157,6 +161,9 @@ fn address_bar(app: &mut App, ui: &mut egui::Ui) {
             ui.colored_label(pal.danger, e.clone());
         }
         _ => {}
+    }
+    if cancel {
+        app.cancel_connect();
     }
 }
 
@@ -255,63 +262,35 @@ fn page_home(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-/// Cartão no topo da tela inicial: instalar o Elo no Windows (um clique → UAC)
-/// ou, se já instalado, um aviso discreto com a opção de desinstalar. A cada
-/// frame relê `is_installed()`, então o cartão troca sozinho assim que a
-/// instalação/desinstalação termina.
+/// Cartão no topo da tela inicial para instalar o Elo no Windows (um clique →
+/// UAC). Some quando já instalado: o local e o "Desinstalar" ficam em
+/// Configurações → Serviço. Relê `is_installed()` a cada frame.
 fn install_card(app: &mut App, ui: &mut egui::Ui) {
+    if crate::install::is_installed() {
+        return;
+    }
     let pal = app.pal;
     let mut do_install = false;
-    let mut do_uninstall = false;
-    if crate::install::is_installed() {
-        egui::Frame::none()
-            .fill(pal.ok.linear_multiply(0.14))
-            .stroke(egui::Stroke::new(1.0_f32, pal.ok))
-            .rounding(12.0)
-            .inner_margin(egui::Margin::same(14.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    dot(ui, pal.ok);
-                    ui.label(
-                        egui::RichText::new(format!("Elo instalado em {}", crate::install::INSTALL_DIR_DISPLAY))
-                            .color(pal.text),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Desinstalar").clicked() {
-                            do_uninstall = true;
-                        }
-                    });
-                });
-            });
-    } else {
-        card(ui, &pal, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(egui::RichText::new("Instalar no Windows").strong().size(15.0).color(pal.text));
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(
-                    "Copia o Elo para Arquivos de Programas e faz com que ele inicie junto com o Windows, \
-                     em segundo plano, com permissão de administrador. O Windows pedirá a sua confirmação (UAC).",
-                )
-                .color(pal.muted),
-            );
-            ui.add_space(10.0);
-            if primary_button(ui, &pal, "  Instalar  ").clicked() {
-                do_install = true;
-            }
-        });
-    }
+    card(ui, &pal, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(egui::RichText::new("Instalar no Windows").strong().size(15.0).color(pal.text));
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "Copia o Elo para Arquivos de Programas e faz com que ele inicie junto com o Windows, \
+                 em segundo plano, com permissão de administrador. O Windows pedirá a sua confirmação (UAC).",
+            )
+            .color(pal.muted),
+        );
+        ui.add_space(10.0);
+        if primary_button(ui, &pal, "  Instalar  ").clicked() {
+            do_install = true;
+        }
+    });
     if do_install {
         match crate::install::elevate_install() {
             Ok(()) => app.toast("Instalando… confirme no UAC. A instalação roda em segundo plano."),
             Err(e) => app.toast(format!("Não foi possível iniciar a instalação: {e}")),
-        }
-    }
-    if do_uninstall {
-        match crate::install::elevate_uninstall() {
-            Ok(()) => app.toast("Desinstalando… confirme no UAC."),
-            Err(e) => app.toast(format!("Não foi possível iniciar a desinstalação: {e}")),
         }
     }
     ui.add_space(12.0);

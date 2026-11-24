@@ -14,12 +14,23 @@ import androidx.compose.runtime.getValue
 import androidx.core.content.ContextCompat
 import io.github.ricardomendes95.elo.core.EloCore
 import io.github.ricardomendes95.elo.data.Prefs
+import io.github.ricardomendes95.elo.host.HostState
 import io.github.ricardomendes95.elo.ui.EloApp
 import io.github.ricardomendes95.elo.ui.theme.EloTheme
 
 class MainActivity : ComponentActivity() {
     private val notifPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* sem ação */ }
+
+    override fun onStart() {
+        super.onStart()
+        HostState.uiVisible = true
+    }
+
+    override fun onStop() {
+        HostState.uiVisible = false
+        super.onStop()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

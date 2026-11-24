@@ -1654,6 +1654,7 @@ name = "elo-android"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "elo-client-core",
  "elo-p2p",
  "elo-protocol",

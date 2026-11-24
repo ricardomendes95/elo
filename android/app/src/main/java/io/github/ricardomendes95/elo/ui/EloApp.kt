@@ -25,6 +25,7 @@ import androidx.navigation.compose.rememberNavController
 import io.github.ricardomendes95.elo.core.EloCore
 import io.github.ricardomendes95.elo.ui.favorites.FavoritesScreen
 import io.github.ricardomendes95.elo.ui.home.HomeScreen
+import io.github.ricardomendes95.elo.ui.home.HostApprovalDialog
 import io.github.ricardomendes95.elo.ui.session.SessionScreen
 import io.github.ricardomendes95.elo.ui.settings.SettingsScreen
 import io.github.ricardomendes95.elo.ui.theme.EloTheme
@@ -53,6 +54,8 @@ fun EloApp() {
         if (active != null && !onSession) nav.navigate(ROUTE_SESSION)
         else if (active == null && onSession) nav.popBackStack()
     }
+
+    HostApprovalDialog()
 
     Scaffold(
         containerColor = c.bg,

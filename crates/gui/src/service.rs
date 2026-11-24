@@ -179,6 +179,10 @@ fn run_service() -> windows_service::Result<()> {
     };
     status_handle.set_service_status(running.clone())?;
 
+    // Ctrl+Alt+Del must be sent by the service process itself; the session
+    // worker requests it through a named event.
+    elo_client_core::platform::spawn_sas_listener();
+
     supervise(&rx);
 
     status_handle.set_service_status(ServiceStatus {

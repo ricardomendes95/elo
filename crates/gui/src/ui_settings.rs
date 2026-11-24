@@ -314,6 +314,32 @@ fn service_tab(app: &mut App, ui: &mut egui::Ui) {
     let pal = app.pal;
     #[cfg(windows)]
     {
+        let app_installed = crate::install::is_installed();
+        settings_group(ui, &pal, "Instalação", |ui| {
+            ui.horizontal(|ui| {
+                crate::theme::dot(ui, if app_installed { pal.ok } else { pal.muted });
+                let text = if app_installed {
+                    format!("Elo instalado em {}", crate::install::INSTALL_DIR_DISPLAY)
+                } else {
+                    "Elo não está instalado (rodando direto deste arquivo).".to_string()
+                };
+                ui.label(egui::RichText::new(text).color(pal.text));
+            });
+            ui.add_space(8.0);
+            if app_installed {
+                if ui.button("Desinstalar o Elo").clicked() {
+                    match crate::install::elevate_uninstall() {
+                        Ok(()) => app.toast("Desinstalando… confirme no UAC."),
+                        Err(e) => app.toast(format!("Não foi possível iniciar a desinstalação: {e}")),
+                    }
+                }
+            } else if primary_button(ui, &pal, "Instalar o Elo").clicked() {
+                match crate::install::elevate_install() {
+                    Ok(()) => app.toast("Instalando… confirme no UAC. A instalação roda em segundo plano."),
+                    Err(e) => app.toast(format!("Não foi possível iniciar a instalação: {e}")),
+                }
+            }
+        });
         let installed = crate::service::is_installed();
         settings_group(ui, &pal, "Serviço do Windows", |ui| {
             ui.label(egui::RichText::new("Com o serviço, o Elo inicia junto com o Windows (antes do login), aceita conexões com a tela bloqueada e permite Ctrl+Alt+Del remoto. Esta janela vira o painel do serviço (aprovações, aviso de quem está conectado).").color(pal.muted));
