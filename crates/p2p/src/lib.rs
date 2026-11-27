@@ -179,6 +179,30 @@ impl Node {
         connect(&self.ep, node).await
     }
 
+    /// Estado do relay "home" para diagnóstico (ex.: `conectado a https://…`),
+    /// ou `sem relay` quando ainda não há nenhum. (O QUIC do iroh já manda
+    /// keepalive a cada 5 s e encerra conexões ociosas após 30 s.)
+    pub fn relay_status(&self) -> String {
+        use iroh::Watcher as _;
+        let list = self.ep.home_relay_status().get();
+        if list.is_empty() {
+            return "sem relay".into();
+        }
+        list.iter()
+            .map(|r| {
+                if r.is_connected() {
+                    format!("conectado a {}", r.url())
+                } else {
+                    match r.last_error() {
+                        Some(e) => format!("desconectado de {} ({e})", r.url()),
+                        None => format!("desconectado de {}", r.url()),
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     /// Is the peer reachable right now? (Quick presence probe.)
     pub async fn ping(&self, node: &str, timeout: std::time::Duration) -> bool {
         let Ok(node_id) = node.trim().parse::<EndpointId>() else { return false };

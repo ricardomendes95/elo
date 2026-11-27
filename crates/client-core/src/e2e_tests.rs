@@ -229,6 +229,21 @@ mod access {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn approval_denial_reason_reaches_the_controller() {
+        let mut o = opts();
+        o.approver = Some(Arc::new(|_| {
+            Box::pin(async {
+                crate::host::set_deny_reason("Computador bloqueado.");
+                false
+            })
+        }));
+        let addr = spawn_host(o).await;
+        let kp = elo_session::generate_keypair().unwrap();
+        let err = connect(&addr, &kp, "", None).await.err().expect("must be refused");
+        assert_eq!(err.to_string(), "Computador bloqueado.");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_password_and_no_approver_is_rejected() {
         let mut o = opts();
         o.password = "secret".into();

@@ -44,13 +44,24 @@ fn set_version_info(res: &mut winresource::WindowsResource, product: &str, descr
         .set("OriginalFilename", file)
         .set("InternalName", file)
         .set_language(0x0416)
-        .set_manifest(MANIFEST);
+        .set_manifest(&manifest());
+}
+
+/// Manifesto com a arquitetura do alvo (x86 para 32 bits, amd64 para 64).
+#[cfg(windows)]
+fn manifest() -> String {
+    let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("x86") => "x86",
+        Ok("aarch64") => "arm64",
+        _ => "amd64",
+    };
+    MANIFEST.replace("{ARCH}", arch)
 }
 
 #[cfg(windows)]
 const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="Elo.Remote" version="0.3.5.0" processorArchitecture="amd64"/>
+  <assemblyIdentity type="win32" name="Elo.Remote" version="0.3.5.0" processorArchitecture="{ARCH}"/>
   <description>Elo - acesso remoto</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>

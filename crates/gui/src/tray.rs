@@ -16,7 +16,7 @@ pub enum TrayEvent {
     Quit,
 }
 
-pub use platform::{start, Tray};
+pub use platform::{alert, main_window_visible, post_quit, start, Tray};
 
 // ---------------------------------------------------------------------------
 // Windows
@@ -32,10 +32,13 @@ mod platform {
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Shell::{
-        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+        Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
+        NIM_MODIFY, NOTIFYICONDATAW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+        AppendMenuW, BringWindowToTop, CreatePopupMenu, FindWindowW, FlashWindowEx, GetForegroundWindow,
+        IsWindowVisible, SetWindowPos, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG, HWND_NOTOPMOST, HWND_TOPMOST,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
         DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostMessageW, PostQuitMessage,
         RegisterClassW, SetForegroundWindow, ShowWindow, TrackPopupMenuEx, TranslateMessage, HICON,
         HWND_MESSAGE, IDI_APPLICATION, MF_STRING, MSG, SW_RESTORE, SW_SHOW, TPM_LEFTALIGN,
@@ -49,6 +52,11 @@ mod platform {
     const WM_TRAY: u32 = WM_APP + 1;
     /// Mensagem que o `Drop` posta para encerrar a janela/thread com limpeza.
     const WM_TRAY_QUIT: u32 = WM_APP + 2;
+    /// Mensagem de alerta (balão + janela à frente); o lParam é um
+    /// `Box<(String, String)>` (título, texto) que a wndproc retoma.
+    const WM_TRAY_ALERT: u32 = WM_APP + 3;
+    /// Clique no balão de notificação (NIN_BALLOONUSERCLICK = WM_USER + 5).
+    const NIN_BALLOONUSERCLICK: u32 = 0x0405;
     /// Id do ícone dentro da janela (único por janela basta).
     const TRAY_UID: u32 = 1;
     /// Ids dos itens do menu de contexto.
@@ -89,6 +97,95 @@ mod platform {
             let _ = ShowWindow(h, SW_RESTORE);
             let _ = SetForegroundWindow(h);
         }
+    }
+
+    /// `HWND` da janela principal: o compartilhado ou, se ainda não for
+    /// conhecido, o da janela de título "Elo".
+    unsafe fn main_or_find(h: isize) -> HWND {
+        if h != 0 {
+            return HWND(h as *mut _);
+        }
+        FindWindowW(None, windows::core::w!("Elo")).unwrap_or_default()
+    }
+
+    /// Mostra a janela e tenta trazê-la à frente mesmo vindo de segundo plano:
+    /// o Windows pode negar o foco (regra de foreground), então ela também sobe
+    /// acima das outras (topmost liga/desliga) e pisca na barra de tarefas.
+    unsafe fn force_front(h: HWND) {
+        if h.0.is_null() {
+            return;
+        }
+        let _ = ShowWindow(h, SW_SHOW);
+        let _ = ShowWindow(h, SW_RESTORE);
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
+        let _ = SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        let _ = SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+        let _ = BringWindowToTop(h);
+        let _ = SetForegroundWindow(h);
+        if GetForegroundWindow() != h {
+            let fi = FLASHWINFO {
+                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                hwnd: h,
+                dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                uCount: 0,
+                dwTimeout: 0,
+            };
+            let _ = FlashWindowEx(&fi);
+        }
+    }
+
+    /// Balão de notificação no ícone da bandeja.
+    unsafe fn balloon(hwnd: HWND, title: &str, text: &str) {
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_UID,
+            uFlags: NIF_INFO,
+            dwInfoFlags: NIIF_INFO,
+            ..Default::default()
+        };
+        let t: Vec<u16> = title.encode_utf16().take(63).collect();
+        // A struct é "packed" no x86 (32 bits): monta o array fora e atribui inteiro.
+        let mut title_buf = [0u16; 64];
+        title_buf[..t.len()].copy_from_slice(&t);
+        nid.szInfoTitle = title_buf;
+        let b: Vec<u16> = text.encode_utf16().take(255).collect();
+        let mut info_buf = [0u16; 256];
+        info_buf[..b.len()].copy_from_slice(&b);
+        nid.szInfo = info_buf;
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+
+    /// Alerta de qualquer thread: com bandeja, posta para a thread dela (balão
+    /// + janela à frente); sem bandeja, só traz a janela à frente daqui mesmo.
+    pub fn alert(tray_hwnd: isize, main_hwnd: isize, title: &str, text: &str) {
+        unsafe {
+            if tray_hwnd != 0 {
+                let payload = Box::into_raw(Box::new((title.to_string(), text.to_string())));
+                let posted =
+                    PostMessageW(HWND(tray_hwnd as *mut _), WM_TRAY_ALERT, WPARAM(0), LPARAM(payload as isize));
+                if posted.is_ok() {
+                    return;
+                }
+                // Não foi postado: a wndproc nunca vai liberar o Box.
+                drop(Box::from_raw(payload));
+            }
+            force_front(main_or_find(main_hwnd));
+        }
+    }
+
+    /// A janela principal está visível (não escondida na bandeja)?
+    pub fn main_window_visible(main_hwnd: isize) -> bool {
+        unsafe {
+            let h = main_or_find(main_hwnd);
+            !h.0.is_null() && IsWindowVisible(h).as_bool()
+        }
+    }
+
+    /// Pede à bandeja (de qualquer thread) para encerrar o app como o "Sair".
+    pub fn post_quit(tray_hwnd: isize) -> bool {
+        tray_hwnd != 0
+            && unsafe { PostMessageW(HWND(tray_hwnd as *mut _), WM_COMMAND, WPARAM(ID_QUIT), LPARAM(0)) }.is_ok()
     }
 
     /// Liga o flag de "sair" e manda `WM_CLOSE` à janela principal via Win32
@@ -141,6 +238,13 @@ mod platform {
     // O `isize` é só um identificador de janela; postar mensagem é thread-safe.
     unsafe impl Send for Tray {}
 
+    impl Tray {
+        /// `HWND` da janela da bandeja, para [`alert`]/[`post_quit`] de outras threads.
+        pub fn hwnd(&self) -> isize {
+            self.hwnd
+        }
+    }
+
     impl Drop for Tray {
         fn drop(&mut self) {
             unsafe {
@@ -158,7 +262,7 @@ mod platform {
             WM_TRAY => {
                 // O evento de mouse vem na parte baixa do lParam.
                 match (lparam.0 as u32) & 0xFFFF {
-                    WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
+                    WM_LBUTTONUP | WM_LBUTTONDBLCLK | NIN_BALLOONUSERCLICK => {
                         show_main_window();
                         emit(TrayEvent::Open);
                     }
@@ -179,6 +283,14 @@ mod platform {
                     }
                     _ => {}
                 }
+                LRESULT(0)
+            }
+            WM_TRAY_ALERT => {
+                // SAFETY: o lParam veio de `alert`, que fez `Box::into_raw`.
+                let payload = Box::from_raw(lparam.0 as *mut (String, String));
+                balloon(hwnd, &payload.0, &payload.1);
+                force_front(main_or_find(main_hwnd().0 as isize));
+                emit(TrayEvent::Open);
                 LRESULT(0)
             }
             WM_TRAY_QUIT => {
@@ -283,7 +395,9 @@ mod platform {
         };
         // Tooltip "Elo" (szTip tem 128 u16, incluindo o nulo).
         let tip: Vec<u16> = tooltip.encode_utf16().take(127).collect();
-        nid.szTip[..tip.len()].copy_from_slice(&tip);
+        let mut tip_buf = [0u16; 128];
+        tip_buf[..tip.len()].copy_from_slice(&tip);
+        nid.szTip = tip_buf;
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
 
         // Avisa o chamador que a janela está pronta (devolve o HWND como isize).
@@ -342,6 +456,22 @@ mod platform {
 
     /// Stub: não há bandeja fora do Windows.
     pub struct Tray;
+
+    impl Tray {
+        pub fn hwnd(&self) -> isize {
+            0
+        }
+    }
+
+    pub fn alert(_tray_hwnd: isize, _main_hwnd: isize, _title: &str, _text: &str) {}
+
+    pub fn main_window_visible(_main_hwnd: isize) -> bool {
+        true
+    }
+
+    pub fn post_quit(_tray_hwnd: isize) -> bool {
+        false
+    }
 
     /// Stub: devolve um canal que nunca recebe eventos.
     pub fn start(

@@ -20,6 +20,21 @@ pub mod discovery;
 pub mod host;
 
 pub use host::HostLink;
+
+/// Liga TCP keepalive (20 s ocioso, sondas a cada 10 s, 3 tentativas) para que
+/// uma conexão LAN cujo outro lado sumiu (Wi-Fi caiu, celular dormiu) seja
+/// derrubada pelo SO em ~50 s em vez de ficar meio-aberta por horas.
+pub fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
+    use std::time::Duration;
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(20))
+        .with_interval(Duration::from_secs(10));
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    let ka = ka.with_retries(3);
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&ka) {
+        tracing::debug!(error = %e, "TCP keepalive indisponível");
+    }
+}
 #[cfg(windows)]
 pub mod platform;
 pub mod rendezvous;

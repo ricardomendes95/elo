@@ -204,9 +204,23 @@ const MAX_LAUNCH_FAILURES: u32 = 3;
 /// `WTSGetActiveConsoleSessionId` result when no session is attached.
 const NO_SESSION: u32 = 0xFFFF_FFFF;
 
+/// Pedidos do handler do SCM para o supervisor.
+enum Ctl {
+    /// Parar o serviço.
+    Stop,
+    /// O sistema voltou da suspensão: recriar o worker (nó P2P, ID curto).
+    Resume,
+    /// Mudou algo nas sessões: reavaliar já, sem esperar o próximo ciclo.
+    Recheck,
+}
+
+/// Intervalo mínimo entre dois reinícios do worker por retomada (o Windows
+/// manda ResumeAutomatic e, com alguém presente, também ResumeSuspend).
+const RESUME_DEBOUNCE: Duration = Duration::from_secs(30);
+
 fn run_service() -> windows_service::Result<()> {
     use windows_service::service::{
-        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        PowerEventParam, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
     };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 
@@ -214,7 +228,16 @@ fn run_service() -> windows_service::Result<()> {
     let handler = move |control| -> ServiceControlHandlerResult {
         match control {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                let _ = tx.send(());
+                let _ = tx.send(Ctl::Stop);
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::PowerEvent(PowerEventParam::ResumeAutomatic | PowerEventParam::ResumeSuspend) => {
+                let _ = tx.send(Ctl::Resume);
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::PowerEvent(_) => ServiceControlHandlerResult::NoError,
+            ServiceControl::SessionChange(_) => {
+                let _ = tx.send(Ctl::Recheck);
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -226,7 +249,10 @@ fn run_service() -> windows_service::Result<()> {
     let running = ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        controls_accepted: ServiceControlAccept::STOP
+            | ServiceControlAccept::SHUTDOWN
+            | ServiceControlAccept::POWER_EVENT
+            | ServiceControlAccept::SESSION_CHANGE,
         exit_code: ServiceExitCode::Win32(0),
         checkpoint: 0,
         wait_hint: Duration::default(),
@@ -250,12 +276,13 @@ fn run_service() -> windows_service::Result<()> {
 
 /// Keep a session worker alive in the active console session until a stop
 /// request arrives on `stop`.
-fn supervise(stop: &std::sync::mpsc::Receiver<()>) {
+fn supervise(stop: &std::sync::mpsc::Receiver<Ctl>) {
     use std::sync::mpsc::RecvTimeoutError;
     use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 
     let mut worker: Option<Worker> = None;
     let mut failures = 0u32;
+    let mut last_resume: Option<std::time::Instant> = None;
     loop {
         // SAFETY: no preconditions; returns 0xFFFFFFFF when no session.
         let session = unsafe { WTSGetActiveConsoleSessionId() };
@@ -283,22 +310,35 @@ fn supervise(stop: &std::sync::mpsc::Receiver<()>) {
             }
         }
         match stop.recv_timeout(SUPERVISE_INTERVAL) {
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) | Ok(Ctl::Recheck) => continue,
+            Ok(Ctl::Resume) => {
+                if last_resume.map_or(true, |t| t.elapsed() >= RESUME_DEBOUNCE) {
+                    last_resume = Some(std::time::Instant::now());
+                    // Termina o worker (Drop); o próximo ciclo o relança com
+                    // um nó P2P novo e re-registra o ID curto.
+                    worker = None;
+                }
+                // Dá um instante para a rede voltar antes de relançar.
+                std::thread::sleep(Duration::from_secs(1));
+            }
             // Stop/Shutdown (or the handler vanished): `worker` drops here and
             // terminates the child.
-            _ => return,
+            Ok(Ctl::Stop) | Err(RecvTimeoutError::Disconnected) => return,
         }
     }
 }
 
 /// Fallback: host inside the service process (session 0) until stopped.
-fn run_in_process(stop: &std::sync::mpsc::Receiver<()>) {
+fn run_in_process(stop: &std::sync::mpsc::Receiver<Ctl>) {
+    // Espera um Stop (ignora Resume/Recheck, que não se aplicam aqui).
+    let wait_stop = || while let Ok(Ctl::Resume | Ctl::Recheck) = stop.recv() {};
     let Ok(rt) = tokio::runtime::Runtime::new() else {
-        let _ = stop.recv();
+        wait_stop();
         return;
     };
-    let task = rt.spawn(crate::worker::run_headless(crate::config::service_dir()));
-    let _ = stop.recv();
+    // Sem watchdog aqui: ele encerraria o próprio serviço.
+    let task = rt.spawn(crate::worker::run_headless(crate::config::service_dir(), false));
+    wait_stop();
     task.abort();
     rt.shutdown_timeout(Duration::from_secs(2));
 }

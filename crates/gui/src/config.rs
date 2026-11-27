@@ -95,6 +95,10 @@ pub struct Config {
     /// em vez de encerrar. Ligado por padrão, no estilo do AnyDesk.
     #[serde(default = "yes")]
     pub close_to_tray: bool,
+    /// Impede a suspensão por inatividade enquanto o Elo aceita conexões
+    /// (power request do Windows). A tela ainda pode apagar.
+    #[serde(default = "yes")]
+    pub keep_awake: bool,
     /// UI theme: "dark" or "light".
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -268,7 +272,7 @@ mod tests {
     fn defaults_are_safe_and_sensible() {
         let c = Config::default();
         assert!(!c.open_access);
-        assert!(c.allow_requests && c.allow_control && c.show_pointer);
+        assert!(c.allow_requests && c.allow_control && c.show_pointer && c.keep_awake);
         assert_eq!(c.theme, "dark");
     }
 

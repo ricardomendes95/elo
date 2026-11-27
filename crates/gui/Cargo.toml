@@ -18,6 +18,8 @@ anyhow = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = "1.0.133"
+# Watchdog: detecta troca de rede (conjunto de IPs locais).
+if-addrs = "0.13"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 qrcode = { version = "0.15.0", default-features = false }
@@ -36,6 +38,7 @@ windows = { version = "0.58.0", features = [
     "Win32_UI_Shell",
     "Win32_Security",
     "Win32_System_LibraryLoader",
+    "Win32_System_Power",
     "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",

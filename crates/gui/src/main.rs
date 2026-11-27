@@ -23,6 +23,7 @@ mod ipc;
 mod keymap;
 mod logging;
 mod logo_pixels;
+mod power;
 #[cfg(windows)]
 mod service;
 mod theme;
@@ -31,6 +32,7 @@ mod ui_home;
 mod ui_manual;
 mod ui_session;
 mod ui_settings;
+mod watchdog;
 mod worker;
 
 use std::collections::{HashMap, VecDeque};
@@ -459,6 +461,18 @@ pub struct App {
     pub tray_notice_shown: bool,
     /// Mantém a janela sempre no topo durante uma sessão de controle.
     pub always_on_top: bool,
+    /// Chamado de qualquer thread quando chega um pedido de aprovação: balão na
+    /// bandeja + janela à frente (mesmo escondida, quando `update()` não roda).
+    attention: Arc<dyn Fn(&str) + Send + Sync>,
+    /// Chegou pedido de aprovação neste frame: mostrar/focar o viewport.
+    approval_arrived: bool,
+    /// Há alguém conectado a este computador (atualizado pelo próprio host).
+    host_busy: Arc<AtomicBool>,
+    /// Há uma conexão de controle ativa ou em andamento (atualizado no `update`).
+    ctl_busy: Arc<AtomicBool>,
+    /// Aviso do watchdog (rede mudou com a janela aberta) para virar toast.
+    net_notice: Arc<Mutex<Option<String>>>,
+    egui_ctx: egui::Context,
 }
 
 impl App {
@@ -509,7 +523,27 @@ impl App {
                 (None, None)
             }
         };
+        let attention: Arc<dyn Fn(&str) + Send + Sync> = {
+            let tray_hwnd = tray.as_ref().map_or(0, |t: &tray::Tray| t.hwnd());
+            let main_hwnd = main_hwnd.clone();
+            let ctx = egui_ctx.clone();
+            Arc::new(move |name: &str| {
+                tray::alert(
+                    tray_hwnd,
+                    main_hwnd.load(Ordering::SeqCst),
+                    "Pedido de conexão — Elo",
+                    &format!("{name} quer acessar este computador"),
+                );
+                ctx.request_repaint();
+            })
+        };
         App {
+            attention,
+            approval_arrived: false,
+            host_busy: Arc::new(AtomicBool::new(false)),
+            ctl_busy: Arc::new(AtomicBool::new(false)),
+            net_notice: Arc::new(Mutex::new(None)),
+            egui_ctx: egui_ctx.clone(),
             rt: Runtime::new().expect("tokio runtime"),
             pal: palette(light),
             draft: config.clone(),
@@ -731,7 +765,7 @@ impl App {
 
         if self.service_mode {
             *status.lock().unwrap() = "online — serviço do Windows (funciona com a tela bloqueada)".into();
-            ipc::spawn_gui_server(&self.rt, config::service_dir(), self.ui_tx.clone());
+            ipc::spawn_gui_server(&self.rt, config::service_dir(), self.ui_tx.clone(), self.attention.clone());
             {
                 // O serviço também registra (idempotente); a GUI registra para exibir o número.
                 let _g = self.rt.enter();
@@ -751,6 +785,13 @@ impl App {
                 }
             });
         } else {
+            {
+                let live = self.live.clone();
+                power::spawn_keep_awake(Arc::new(move || live.lock().unwrap().keep_awake));
+            }
+            self.spawn_watchdog();
+            let attention = self.attention.clone();
+            let host_busy = self.host_busy.clone();
             let my_node = self.my_node.clone();
             let keypair = hostrun::load_or_create_keypair(&config::config_dir());
             let live = self.live.clone();
@@ -773,7 +814,7 @@ impl App {
                 *my_node.lock().unwrap() = node.id();
                 *node_slot.lock().unwrap() = Some(node.clone());
                 let nid = node.id();
-                hostrun::spawn_directory(directory, short, Arc::new(move || nid.clone()), Some(short_state), None);
+                hostrun::spawn_directory(directory, short, Arc::new(move || nid.clone()), Some(short_state.clone()), None);
 
                 let live2 = live.clone();
                 let pw2 = pw.clone();
@@ -782,16 +823,31 @@ impl App {
                 let tx = ui_tx.clone();
                 let approver: ApproveFn = Arc::new(move |peer| {
                     let tx = tx.clone();
+                    let attention = attention.clone();
                     Box::pin(async move {
+                        // Tela bloqueada: ninguém vai ver o pedido; recusa já,
+                        // com o motivo para o controlador.
+                        if power::session_locked() {
+                            tracing::info!(peer = %peer.name, "pedido de aprovação recusado: sessão bloqueada");
+                            elo_client_core::host::set_deny_reason(power::NOBODY_TO_APPROVE);
+                            return false;
+                        }
                         let (otx, orx) = tokio::sync::oneshot::channel();
+                        let name = peer.name.clone();
                         if tx.send(UiEvent::Approval { name: peer.name, fp: peer.fingerprint, reply: otx }).is_err() {
                             return false;
                         }
-                        orx.await.unwrap_or(false)
+                        attention(&name);
+                        power::unless_locked(async move { orx.await.unwrap_or(false) }).await
                     })
                 });
                 let tx = std::sync::Mutex::new(ui_tx.clone());
                 let on_event: EventFn = Arc::new(move |ev| {
+                    match &ev {
+                        elo_client_core::host::HostEvent::Connected { .. } => host_busy.store(true, Ordering::SeqCst),
+                        elo_client_core::host::HostEvent::Disconnected { .. } => host_busy.store(false, Ordering::SeqCst),
+                        _ => {}
+                    }
                     let _ = tx.lock().unwrap().send(events::from_host_event(ev));
                 });
                 let live3 = live.clone();
@@ -811,11 +867,49 @@ impl App {
                     online_text: online,
                     after_session,
                     link_out: Some(link_out),
+                    short: Some(short_state),
                 })
                 .await;
             });
         }
         self.spawn_presence();
+    }
+
+    /// Watchdog da GUI hospedando sem serviço: após suspensão/troca de rede,
+    /// recria o host reiniciando o Elo (`--restarted --tray`) quando ele está
+    /// escondido na bandeja e ocioso; com a janela aberta, só avisa (uma vez).
+    fn spawn_watchdog(&self) {
+        let host_busy = self.host_busy.clone();
+        let ctl_busy = self.ctl_busy.clone();
+        let main_hwnd = self.main_hwnd.clone();
+        let tray_hwnd = self.tray.as_ref().map_or(0, |t| t.hwnd());
+        let notice = self.net_notice.clone();
+        let ctx = self.egui_ctx.clone();
+        let warned = AtomicBool::new(false);
+        watchdog::spawn(
+            Arc::new(move || host_busy.load(Ordering::SeqCst)),
+            Box::new(move |reason| {
+                let hidden = !tray::main_window_visible(main_hwnd.load(Ordering::SeqCst));
+                if hidden && tray_hwnd != 0 && !ctl_busy.load(Ordering::SeqCst) {
+                    let spawned = std::env::current_exe()
+                        .and_then(|exe| std::process::Command::new(exe).args(["--restarted", "--tray"]).spawn());
+                    match spawned {
+                        Ok(_) if tray::post_quit(tray_hwnd) => {
+                            tracing::warn!(motivo = %reason, "watchdog: reiniciando o Elo para recriar o host");
+                            return true;
+                        }
+                        Ok(_) => tracing::warn!("watchdog: não consegui encerrar esta instância"),
+                        Err(e) => tracing::warn!(error = %e, "watchdog: não consegui reiniciar o Elo"),
+                    }
+                }
+                if !warned.swap(true, Ordering::SeqCst) {
+                    tracing::warn!(motivo = %reason, "watchdog: rede mudou; aguardando o Elo ficar ocioso na bandeja para reiniciar");
+                    *notice.lock().unwrap() = Some(reason.to_string());
+                    ctx.request_repaint();
+                }
+                false
+            }),
+        );
     }
 
     fn display_name(&self) -> String {
@@ -1074,6 +1168,7 @@ impl App {
         while let Ok(ev) = self.ui_rx.try_recv() {
             match ev {
                 UiEvent::Approval { name, fp, reply } => {
+                    self.approval_arrived = true;
                     self.approvals.push_back(PendingApproval { name, fp, reply: Some(reply), trust: false });
                 }
                 UiEvent::Connected { name, fp, ctl } => {
@@ -1506,7 +1601,18 @@ impl eframe::App for App {
             }
         }
         self.pump_events();
+        // Pedidos já respondidos por outro caminho (tempo esgotado, tela
+        // bloqueada, worker caiu) saem da fila.
+        self.approvals.retain(|a| a.reply.as_ref().is_some_and(|r| !r.is_closed()));
+        if std::mem::take(&mut self.approval_arrived) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if self.net_notice.lock().unwrap().take().is_some() {
+            self.toast_error("Rede mudou — reinicie o Elo (ele reinicia sozinho quando estiver na bandeja e ocioso).");
+        }
         self.poll_connect();
+        self.ctl_busy.store(matches!(self.conn, Conn::Active(_) | Conn::Connecting(_)), Ordering::SeqCst);
         self.poll_bg();
         self.sync_short_id();
         self.drain_tray(ctx);

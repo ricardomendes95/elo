@@ -116,6 +116,19 @@ impl HostLink {
     }
 }
 
+tokio::task_local! {
+    /// Motivo de recusa definido pelo approver (ver [`set_deny_reason`]).
+    static DENY_REASON: std::cell::RefCell<Option<String>>;
+}
+
+/// Chamado de dentro do future de um [`ApproveFn`] que vai devolver `false`:
+/// o texto é enviado ao controlador (como `Chat` logo antes de `AuthFailed`) e
+/// aparece no erro de conexão dele. Fora de um approver, não faz nada.
+pub fn set_deny_reason(reason: impl Into<String>) {
+    let reason = reason.into();
+    let _ = DENY_REASON.try_with(|r| *r.borrow_mut() = Some(reason));
+}
+
 /// Async "Allow?" callback: returns true to allow.
 pub type ApproveFn = Arc<dyn Fn(PeerInfo) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 /// Event sink.
@@ -267,6 +280,18 @@ where
 
 static FAILURES: StdMutex<Vec<Instant>> = StdMutex::new(Vec::new());
 
+/// Sem nenhuma mensagem do controlador por este tempo, a sessão é encerrada
+/// (o controlador manda `Ping` a cada 15 s, mesmo só visualizando).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Instante da última mensagem recebida de um controlador (diagnóstico).
+static LAST_ACTIVITY: StdMutex<Option<Instant>> = StdMutex::new(None);
+
+/// Quando chegou a última mensagem de um controlador numa sessão (se houve).
+pub fn last_controller_activity() -> Option<Instant> {
+    *LAST_ACTIVITY.lock().unwrap()
+}
+
 fn locked_out() -> bool {
     let mut f = FAILURES.lock().unwrap();
     f.retain(|t| t.elapsed() < Duration::from_secs(60));
@@ -339,6 +364,7 @@ where
     let typed_empty = proof == auth_proof(&salt, "");
     let pw_ok = !opts.password.is_empty() && proof == auth_proof(&salt, &opts.password);
 
+    let mut deny_reason: Option<String> = None;
     let path = if opts.trusted.iter().any(|t| t.eq_ignore_ascii_case(&peer.fingerprint)) {
         Some(Path::Trusted)
     } else if opts.open_access {
@@ -348,9 +374,16 @@ where
     } else if typed_empty {
         match &opts.approver {
             Some(ask) => {
-                let allowed = tokio::time::timeout(Duration::from_secs(120), ask(peer.clone()))
-                    .await
-                    .unwrap_or(false);
+                let fut = ask(peer.clone());
+                let (allowed, reason) = DENY_REASON
+                    .scope(std::cell::RefCell::new(None), async move {
+                        let allowed = tokio::time::timeout(Duration::from_secs(120), fut).await.unwrap_or(false);
+                        (allowed, DENY_REASON.with(|r| r.borrow_mut().take()))
+                    })
+                    .await;
+                if !allowed {
+                    deny_reason = reason;
+                }
                 allowed.then_some(Path::Approved)
             }
             None => None,
@@ -360,8 +393,17 @@ where
     };
     let Some(path) = path else {
         tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some(reason) = &deny_reason {
+            // Controladores novos guardam o texto e o mostram no erro; os antigos
+            // abortam com "expected auth result, got Chat(...)", que também o exibe.
+            let _ = enc.send(&encode_msg(&SessionMsg::Chat(reason.clone()))).await;
+        }
         let _ = enc.send(&encode_msg(&SessionMsg::AuthFailed)).await;
-        fail(if typed_empty { "denied or no approver" } else { "wrong password" });
+        fail(match &deny_reason {
+            Some(r) => r.as_str(),
+            None if typed_empty => "denied or no approver",
+            None => "wrong password",
+        });
         bail!("controller failed authentication");
     };
 
@@ -419,7 +461,7 @@ where
 
     // Writer: the single owner of the encrypted sender.
     let mut sender = tx;
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(bytes) = out_rx.recv().await {
             if sender.send(&bytes).await.is_err() {
                 break;
@@ -540,12 +582,29 @@ where
     // The cancel sender lives in the HostSessionHandle; if nobody kept it, the
     // channel just closes — that must not end the session.
     let mut cancel_alive = true;
+    let mut last_rx = tokio::time::Instant::now();
+    *LAST_ACTIVITY.lock().unwrap() = Some(Instant::now());
     let result: Result<()> = loop {
         let bytes = tokio::select! {
             r = rx.recv() => match r {
-                Ok(b) => b,
+                Ok(b) => {
+                    last_rx = tokio::time::Instant::now();
+                    *LAST_ACTIVITY.lock().unwrap() = Some(Instant::now());
+                    b
+                }
                 Err(_) => break Ok(()),
             },
+            // Conexão meio-aberta (o controlador sumiu sem fechar): sem isto a
+            // sessão ficaria "ativa" para sempre.
+            _ = tokio::time::sleep_until(last_rx + IDLE_TIMEOUT) => {
+                warn!(peer = %peer.name, "controller silent for 90 s; ending session");
+                break Ok(());
+            }
+            // O envio falhou (conexão caiu): não há mais sessão.
+            _ = &mut writer => {
+                info!(peer = %peer.name, "send side closed; ending session");
+                break Ok(());
+            }
             r = cancel_rx.changed(), if cancel_alive => {
                 match r {
                     Ok(()) if *cancel_rx.borrow() => {
@@ -655,7 +714,12 @@ where
     }
     drop(clipboard);
     if let Some(slot) = &opts.link_out {
-        *slot.lock().unwrap() = None;
+        // Só limpa se ainda for o desta sessão (uma sessão nova pode já ter
+        // assumido o lugar).
+        let mut g = slot.lock().unwrap();
+        if g.as_ref().is_some_and(|l| l.out.same_channel(&out_tx)) {
+            *g = None;
+        }
     }
     opts.emit(HostEvent::Disconnected { peer });
     result

@@ -63,7 +63,14 @@ async fn write_msg(w: &mut (impl AsyncWriteExt + Unpin), m: &Msg) -> std::io::Re
 // ---------------------------------------------------------------------------
 
 /// Listen for the session worker and turn its messages into UI events.
-pub fn spawn_gui_server(rt: &tokio::runtime::Runtime, token_dir: std::path::PathBuf, ui: std::sync::mpsc::Sender<UiEvent>) {
+/// `on_approval(nome)` é chamado (fora da thread da UI) a cada pedido de
+/// aprovação, para trazer a janela à frente mesmo escondida na bandeja.
+pub fn spawn_gui_server(
+    rt: &tokio::runtime::Runtime,
+    token_dir: std::path::PathBuf,
+    ui: std::sync::mpsc::Sender<UiEvent>,
+    on_approval: Arc<dyn Fn(&str) + Send + Sync>,
+) {
     rt.spawn(async move {
         let listener = match TcpListener::bind(("127.0.0.1", PORT)).await {
             Ok(l) => l,
@@ -76,6 +83,7 @@ pub fn spawn_gui_server(rt: &tokio::runtime::Runtime, token_dir: std::path::Path
             let Ok((stream, _)) = listener.accept().await else { continue };
             let ui = ui.clone();
             let token_dir = token_dir.clone();
+            let on_approval = on_approval.clone();
             tokio::spawn(async move {
                 let (r, mut w) = stream.into_split();
                 let mut lines = BufReader::new(r).lines();
@@ -99,6 +107,7 @@ pub fn spawn_gui_server(rt: &tokio::runtime::Runtime, token_dir: std::path::Path
                 });
                 while let Ok(Some(l)) = lines.next_line().await {
                     let Ok(m) = serde_json::from_str::<Msg>(&l) else { continue };
+                    let mut alert: Option<String> = None;
                     let ev = match m {
                         Msg::Approve { id, name, fp } => {
                             let (otx, orx) = oneshot::channel::<bool>();
@@ -107,6 +116,7 @@ pub fn spawn_gui_server(rt: &tokio::runtime::Runtime, token_dir: std::path::Path
                                 let allow = orx.await.unwrap_or(false);
                                 let _ = tx2.send(Msg::ApproveReply { id, allow }).await;
                             });
+                            alert = Some(name.clone());
                             UiEvent::Approval { name, fp, reply: otx }
                         }
                         Msg::Connected { name, fp } => UiEvent::Connected { name, fp, ctl: HostCtl::Remote(tx.clone()) },
@@ -119,6 +129,9 @@ pub fn spawn_gui_server(rt: &tokio::runtime::Runtime, token_dir: std::path::Path
                     };
                     if ui.send(ev).is_err() {
                         break;
+                    }
+                    if let Some(name) = alert {
+                        on_approval(&name);
                     }
                 }
                 tracing::info!("serviço desconectou da interface");
@@ -199,6 +212,11 @@ impl WorkerLink {
             }
         });
         link
+    }
+
+    /// Há uma interface (GUI do usuário) conectada a este worker?
+    pub fn has_gui(&self) -> bool {
+        self.out.lock().unwrap().is_some()
     }
 
     pub fn send(&self, m: Msg) {

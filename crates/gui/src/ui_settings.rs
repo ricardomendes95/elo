@@ -102,6 +102,15 @@ fn general(app: &mut App, ui: &mut egui::Ui) {
     settings_group(ui, &pal, "Inicialização", |ui| {
         toggle_row(ui, &pal, "Iniciar o Elo com o sistema", "Abre o Elo quando você entra no Windows.", &mut app.draft.autostart);
     });
+    settings_group(ui, &pal, "Energia", |ui| {
+        toggle_row(
+            ui,
+            &pal,
+            "Manter o computador acordado",
+            "Impedir a suspensão por inatividade enquanto o Elo aceita conexões (a tela ainda pode apagar).",
+            &mut app.draft.keep_awake,
+        );
+    });
     save_row(app, ui);
 }
 

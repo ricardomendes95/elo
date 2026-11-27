@@ -173,6 +173,7 @@ pub async fn run_controller_direct_opts(
     let stream = tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(&cfg.host))
         .await
         .map_err(|_| anyhow::anyhow!("tempo esgotado ao conectar em {}", cfg.host))??;
+    crate::set_tcp_keepalive(&stream);
     connect_session(stream, None, &cfg.keypair, &cfg.password, cfg.download_dir, opts).await
 }
 
@@ -234,11 +235,17 @@ where
         m => bail!("expected AuthRequired, got {m:?}"),
     };
     enc.send(&encode_msg(&SessionMsg::AuthSubmit { proof: auth_proof(&salt, password) })).await?;
+    // Motivo de recusa que o host pode mandar (como Chat) antes de AuthFailed.
+    let mut deny_reason: Option<String> = None;
     loop {
         // May take a while: the host user could be deciding Allow/Deny.
         match decode_msg(&enc.recv().await?)? {
             SessionMsg::AuthOk => break,
+            SessionMsg::Chat(text) => deny_reason = Some(text.chars().take(300).collect()),
             SessionMsg::AuthFailed => {
+                if let Some(reason) = deny_reason {
+                    bail!("{reason}");
+                }
                 if password.is_empty() {
                     bail!("acesso negado pelo host (ou sem aprovação disponível)");
                 }

@@ -211,13 +211,63 @@ pub struct HostRun {
     /// When set, the host publishes a live link to the connected controller here
     /// (`Some` while connected, `None` otherwise) so the UI can send it files.
     pub link_out: Option<Arc<Mutex<Option<elo_client_core::HostLink>>>>,
+    /// Estado do registro do ID curto, para a linha de saúde do log.
+    pub short: Option<SharedShort>,
+}
+
+/// Intervalo da linha de saúde no log.
+const HEALTH_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Sessão em andamento: id da conexão, controle e início.
+type Current = Arc<Mutex<Option<(u64, elo_client_core::host::HostSessionHandle, std::time::Instant)>>>;
+
+/// Uma linha de log com o estado do host (a cada 10 min).
+fn spawn_health_log(node: elo_p2p::Node, current: Current, short: Option<SharedShort>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(HEALTH_EVERY);
+        loop {
+            tick.tick().await;
+            let session = match current.lock().unwrap().as_ref() {
+                Some((_, _, since)) => format!("sim, há {} s", since.elapsed().as_secs()),
+                None => "não".into(),
+            };
+            let last = elo_client_core::host::last_controller_activity()
+                .map_or("nunca".into(), |t| format!("há {} s", t.elapsed().as_secs()));
+            let short = match &short {
+                Some(st) => {
+                    let g = st.lock().unwrap();
+                    match (&g.error, &g.id) {
+                        (Some(e), _) => format!("erro: {e}"),
+                        (None, Some(id)) => format!("ok ({id})"),
+                        (None, None) if g.registering => "registrando".into(),
+                        (None, None) => "ainda não registrado".into(),
+                    }
+                }
+                None => "n/d".into(),
+            };
+            tracing::info!(
+                sessao = %session,
+                ultima_atividade = %last,
+                relay = %node.relay_status(),
+                id_curto = %short,
+                "saúde do host"
+            );
+        }
+    });
 }
 
 /// Run the host forever.
+///
+/// As conexões são atendidas em paralelo: uma sessão antiga meio-aberta não
+/// bloqueia as novas. Quando uma conexão nova autentica com uma sessão em
+/// andamento, a antiga é encerrada (normalmente é o mesmo usuário reconectando).
 pub async fn run(h: HostRun) {
     #[cfg(windows)]
     {
-        use elo_client_core::host::{serve_host_opts, HostOptions};
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use elo_client_core::host::{serve_host_opts, HostEvent, HostOptions};
         use elo_client_core::platform::{DxgiCapture, SendInputSink};
         use elo_client_core::Capture;
 
@@ -232,6 +282,14 @@ pub async fn run(h: HostRun) {
         }
         let listener = listener.ok();
         *h.status.lock().unwrap() = h.online_text.clone();
+
+        let current: Current = Arc::new(Mutex::new(None));
+        // Sessões derrubadas por uma conexão nova: o "desconectou" delas não
+        // vai para a UI (a nova já tomou o lugar).
+        let superseded: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+        let next_id = AtomicU64::new(1);
+        spawn_health_log(h.node.clone(), current.clone(), h.short.clone());
+
         loop {
             let incoming: anyhow::Result<In> = tokio::select! {
                 r = async {
@@ -250,14 +308,46 @@ pub async fn run(h: HostRun) {
                     continue;
                 }
             };
+            let id = next_id.fetch_add(1, Ordering::Relaxed);
+            let busy = current.lock().unwrap().is_some();
+            match &incoming {
+                In::Lan(st) => {
+                    elo_client_core::set_tcp_keepalive(st);
+                    let from = st.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
+                    tracing::info!(conn = id, origem = "LAN", %from, sessao_ativa = busy, "conexão recebida");
+                }
+                In::P2p(_) => tracing::info!(conn = id, origem = "P2P", sessao_ativa = busy, "conexão recebida"),
+            }
+
             let s = (h.settings)();
+            let fwd = h.on_event.clone();
+            let (cur, sup) = (current.clone(), superseded.clone());
+            let on_event: elo_client_core::host::EventFn = Arc::new(move |ev| {
+                match &ev {
+                    HostEvent::Connected { session, .. } => {
+                        *cur.lock().unwrap() = Some((id, session.clone(), std::time::Instant::now()));
+                    }
+                    HostEvent::Disconnected { .. } => {
+                        if sup.lock().unwrap().remove(&id) {
+                            tracing::info!(conn = id, "sessão anterior encerrada (substituída)");
+                            return;
+                        }
+                        let mut g = cur.lock().unwrap();
+                        if g.as_ref().is_some_and(|c| c.0 == id) {
+                            *g = None;
+                        }
+                    }
+                    _ => {}
+                }
+                fwd(ev)
+            });
             let opts = HostOptions {
                 password: s.password,
                 open_access: s.open_access,
                 trusted: s.trusted,
                 totp_secret: s.totp_secret,
                 approver: s.allow_requests.then(|| h.approver.clone()),
-                on_event: Some(h.on_event.clone()),
+                on_event: Some(on_event),
                 permissions: s.permissions,
                 fps: 30,
                 download_dir: h.download_dir.clone(),
@@ -265,25 +355,54 @@ pub async fn run(h: HostRun) {
                 show_pointer: s.show_pointer,
                 link_out: h.link_out.clone(),
             };
-            let factory = || -> anyhow::Result<(DxgiCapture, SendInputSink)> {
-                let c = DxgiCapture::new()?;
+            let (cur, sup) = (current.clone(), superseded.clone());
+            // Chamado só depois que o novo controlador autenticou.
+            let factory = move || -> anyhow::Result<(DxgiCapture, SendInputSink)> {
+                let old = cur.lock().unwrap().take();
+                let had_old = old.is_some();
+                if let Some((old_id, handle, _)) = old {
+                    tracing::info!(conn = id, anterior = old_id, "nova conexão autenticada; encerrando a sessão anterior");
+                    sup.lock().unwrap().insert(old_id);
+                    handle.disconnect();
+                }
+                // A captura da sessão anterior pode levar um instante para ser
+                // liberada: tenta por até ~3 s.
+                let mut tries = 0;
+                let c = loop {
+                    match DxgiCapture::new() {
+                        Ok(c) => break c,
+                        Err(e) if tries < 15 && had_old => {
+                            tracing::debug!(error = %e, "captura ainda ocupada; tentando de novo");
+                            tries += 1;
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                };
                 let i = SendInputSink::new(c.width(), c.height());
                 Ok((c, i))
             };
-            let r = match incoming {
-                In::Lan(st) => serve_host_opts(st, &h.keypair, opts, factory).await,
-                In::P2p(d) => serve_host_opts(d, &h.keypair, opts, factory).await,
-            };
-            match r {
-                Ok(()) => (h.after_session)(),
-                Err(e) => tracing::debug!(error = %e, "conexão encerrada"),
-            }
-            *h.status.lock().unwrap() = h.online_text.clone();
+            let keypair = h.keypair.clone();
+            let after_session = h.after_session.clone();
+            let status = h.status.clone();
+            let online_text = h.online_text.clone();
+            tokio::spawn(async move {
+                let r = match incoming {
+                    In::Lan(st) => serve_host_opts(st, &keypair, opts, factory).await,
+                    In::P2p(d) => serve_host_opts(d, &keypair, opts, factory).await,
+                };
+                match r {
+                    Ok(()) => after_session(),
+                    Err(e) => tracing::info!(conn = id, error = %e, "conexão encerrada"),
+                }
+                *status.lock().unwrap() = online_text;
+            });
         }
     }
     #[cfg(not(windows))]
     {
-        let _ = (&h.node, &h.keypair, &h.download_dir, &h.settings, &h.approver, &h.on_event, &h.after_session, &h.online_text);
+        let _ = (&h.keypair, &h.download_dir, &h.settings, &h.approver, &h.on_event, &h.after_session, &h.online_text);
+        spawn_health_log(h.node.clone(), Arc::new(Mutex::new(None)), h.short.clone());
         *h.status.lock().unwrap() = "pronto para conectar (servir a própria tela requer Windows)".into();
         std::future::pending::<()>().await
     }

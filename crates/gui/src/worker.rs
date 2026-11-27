@@ -13,16 +13,22 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use elo_client_core::host::{ApproveFn, EventFn, HostEvent};
+use elo_client_core::host::{set_deny_reason, ApproveFn, EventFn, HostEvent};
 
 use crate::config::Config;
 use crate::hostrun::{self, HostRun, HostSettings, DIRECT_PORT};
 use crate::ipc::{self, Msg, WorkerLink};
 
-/// Host loop forever using the state in `state_dir`.
-pub async fn run_headless(state_dir: PathBuf) {
+/// Host loop forever using the state in `state_dir`. `watchdog`: encerra o
+/// processo (código 3) após suspensão/troca de rede, para o supervisor do
+/// serviço relançar o worker — só faz sentido no `--session-worker`.
+pub async fn run_headless(state_dir: PathBuf, watchdog: bool) {
     crate::logging::init(&state_dir);
     let _ = std::fs::create_dir_all(&state_dir);
+    {
+        let dir = state_dir.clone();
+        crate::power::spawn_keep_awake(Arc::new(move || Config::load_from(&dir).keep_awake));
+    }
     let keypair = hostrun::load_or_create_keypair(&state_dir);
     let node = loop {
         match elo_p2p::bind_node(&state_dir.join("node.key")).await {
@@ -36,6 +42,7 @@ pub async fn run_headless(state_dir: PathBuf) {
     tracing::info!(node = %node.id(), "host do serviço ativo");
 
     let cfg0 = Config::load_from(&state_dir);
+    let short_state: hostrun::SharedShort = Arc::new(Mutex::new(hostrun::ShortState::default()));
     {
         let nid = node.id();
         let dir = state_dir.clone();
@@ -46,10 +53,21 @@ pub async fn run_headless(state_dir: PathBuf) {
                 c.save_to(&dir);
             }
         });
-        hostrun::spawn_directory(cfg0.directory_url(), cfg0.short_id.clone(), Arc::new(move || nid.clone()), None, Some(on_id));
+        hostrun::spawn_directory(cfg0.directory_url(), cfg0.short_id.clone(), Arc::new(move || nid.clone()), Some(short_state.clone()), Some(on_id));
     }
 
     let link = WorkerLink::start(ipc::token(&state_dir));
+
+    if watchdog {
+        let l = link.clone();
+        crate::watchdog::spawn(
+            Arc::new(move || l.session.lock().unwrap().is_some()),
+            Box::new(|reason| {
+                tracing::warn!(motivo = %reason, "watchdog: encerrando o worker para o serviço relançá-lo");
+                std::process::exit(3)
+            }),
+        );
+    }
 
     let dir = state_dir.clone();
     let settings: Arc<dyn Fn() -> HostSettings + Send + Sync> =
@@ -64,7 +82,23 @@ pub async fn run_headless(state_dir: PathBuf) {
     let l = link.clone();
     let approver: ApproveFn = Arc::new(move |peer| {
         let l = l.clone();
-        Box::pin(async move { l.approve(peer.name, peer.fingerprint).await })
+        Box::pin(async move {
+            // Ninguém para responder (tela bloqueada ou nenhuma interface
+            // aberta): recusa na hora, com o motivo para o controlador, em vez
+            // de deixá-lo "conectando" até o tempo esgotar.
+            let gui = l.has_gui();
+            if !gui || crate::power::session_locked() {
+                tracing::info!(peer = %peer.name, gui, "pedido de aprovação recusado: ninguém para aprovar");
+                set_deny_reason(crate::power::NOBODY_TO_APPROVE);
+                return false;
+            }
+            let allowed = crate::power::unless_locked(l.approve(peer.name, peer.fingerprint)).await;
+            if !allowed && !l.has_gui() {
+                // A interface fechou no meio do pedido.
+                set_deny_reason(crate::power::NOBODY_TO_APPROVE);
+            }
+            allowed
+        })
     });
 
     let l = link.clone();
@@ -96,6 +130,7 @@ pub async fn run_headless(state_dir: PathBuf) {
         online_text: format!("serviço online — LAN :{DIRECT_PORT}"),
         after_session: Arc::new(|| {}),
         link_out: None,
+        short: Some(short_state),
     })
     .await
 }
@@ -103,6 +138,6 @@ pub async fn run_headless(state_dir: PathBuf) {
 /// Entry for `elo.exe --session-worker`.
 pub fn run_worker() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_headless(crate::config::service_dir()));
+    rt.block_on(run_headless(crate::config::service_dir(), true));
     Ok(())
 }

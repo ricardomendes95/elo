@@ -26,6 +26,8 @@ serde_json = "1.0.133"
 rand = { workspace = true }
 # Enumerar interfaces de rede para o broadcast de descoberta sair por todas elas.
 if-addrs = "0.13"
+# TCP keepalive nas conexões LAN (detecta peer que sumiu sem fechar).
+socket2 = { version = "0.6", features = ["all"] }
 async-trait = "0.1.83"
 # 2FA (TOTP, RFC 6238)
 hmac = "0.13.0"
