@@ -330,10 +330,10 @@ fn connection(app: &mut App, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Conexão P2P automática (iroh): ligação direta por NAT hole punching, com relays gratuitos de reserva. Nada a configurar.").color(pal.muted));
     });
     settings_group(ui, &pal, "ID curto (diretório)", |ui| {
-        ui.label(egui::RichText::new("Para usar um número de 9 dígitos em vez do endereço longo, informe um servidor de diretório (host:porta) — suba o seu com `elo-client relay`. O vídeo continua P2P; o diretório só traduz o número. Reinicie o Elo após mudar.").color(pal.muted));
+        ui.label(egui::RichText::new("Formatos aceitos: `https://...` (diretório HTTPS, o padrão): o número de 9 dígitos é estável e continua o mesmo ao reinstalar o Elo (só muda se o Windows for reinstalado); ou `host:porta` (relay TCP próprio, suba com `elo-client relay`), cujo número é gerado por instalação. Deixe em branco para usar o diretório padrão. O vídeo continua P2P; o diretório só traduz o número. Reinicie o Elo após mudar.").color(pal.muted));
         ui.add_space(6.0);
         setting_row(ui, &pal, "Servidor", "", 270.0, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.draft.directory).desired_width(260.0).hint_text("ex.: meu-vps.com:9000"));
+            ui.add(egui::TextEdit::singleline(&mut app.draft.directory).desired_width(260.0).hint_text("https://... ou meu-vps.com:9000"));
         });
     });
     settings_group(ui, &pal, "Rede local", |ui| {

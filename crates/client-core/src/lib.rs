@@ -23,6 +23,7 @@ pub use host::HostLink;
 #[cfg(windows)]
 pub mod platform;
 pub mod rendezvous;
+pub mod shortid;
 pub mod totp;
 pub mod transfer;
 

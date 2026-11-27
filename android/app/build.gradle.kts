@@ -15,8 +15,8 @@ android {
         applicationId = "io.github.ricardomendes95.elo"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.3.7"
+        versionCode = 8
+        versionName = "0.3.8"
         ndk { abiFilters += eloAbis }
     }
 

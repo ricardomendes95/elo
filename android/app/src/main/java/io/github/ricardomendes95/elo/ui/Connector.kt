@@ -17,6 +17,8 @@ sealed interface ConnState {
     data object Idle : ConnState
     data class Connecting(val label: String) : ConnState
     data object NeedTwoFa : ConnState
+    /** O node id resolvido difere do último salvo: pedir confirmação. */
+    data object IdentityChanged : ConnState
     data class Error(val message: String) : ConnState
 }
 
@@ -29,15 +31,44 @@ object Connector {
     private var generation = 0
     private var pending: ConnectRequest? = null
 
+    private fun looksShort(t: String) = t.count { it.isDigit() } == 9 && t.length <= 11 && t.all { it.isDigit() || it == ' ' }
+
     fun start(target: String, lan: Boolean, password: String, label: String = "") {
         if (_state.value is ConnState.Connecting) return
-        run(
-            ConnectRequest(
-                target = target, lan = lan, password = password,
-                name = Prefs.deviceName.value.ifBlank { EloCore.defaultDeviceName() },
-                directory = Prefs.directory.value, label = label,
-            ),
+        val req = ConnectRequest(
+            target = target, lan = lan, password = password,
+            name = Prefs.deviceName.value.ifBlank { EloCore.defaultDeviceName() },
+            directory = Prefs.directory.value, label = label,
         )
+        if (lan || !looksShort(target.trim())) { run(req); return }
+        // ID curto: resolve antes para comparar a identidade com a última vista.
+        val gen = ++generation
+        pending = req
+        _state.value = ConnState.Connecting(req.label.ifBlank { req.target })
+        scope.launch {
+            val r = EloCore.resolveShortId(req.directory, req.target)
+            if (gen != generation) return@launch
+            r.onFailure {
+                Log.w("Elo", "Falha ao resolver o ID curto: ${it.message}")
+                pending = null
+                _state.value = ConnState.Error(it.message ?: "Não foi possível resolver o ID curto.")
+            }.onSuccess { node ->
+                val last = Prefs.lastNode(req.target, false)
+                val withNode = req.copy(resolvedNode = node)
+                if (node.isNotEmpty() && last.isNotEmpty() && last != node) {
+                    pending = withNode
+                    _state.value = ConnState.IdentityChanged
+                } else {
+                    run(withNode)
+                }
+            }
+        }
+    }
+
+    /** Confirma conectar após o aviso de identidade alterada. */
+    fun confirmIdentity() {
+        val req = pending ?: return
+        run(req)
     }
 
     fun submitTotp(code: String) {
@@ -69,6 +100,7 @@ object Connector {
             when (result) {
                 is ConnectResult.Ok -> {
                     Prefs.addRecent(req.label, req.target, req.lan, req.password)
+                    req.resolvedNode?.takeIf { it.isNotEmpty() }?.let { Prefs.setLastNode(req.target, req.lan, it) }
                     pending = null
                     _state.value = ConnState.Idle
                 }

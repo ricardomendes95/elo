@@ -156,7 +156,7 @@ impl Elo {
         let keypair = load_or_create_keypair(&self.data_dir);
         let name: String = name.trim().chars().take(64).collect();
         let name = if name.is_empty() { "Android".to_string() } else { name };
-        presence_announce(name, short_id(&keypair), true);
+        presence_announce(name, effective_short(&keypair), true);
         let download_dir = self.data_dir.join("Recebidos");
         let _ = std::fs::create_dir_all(&download_dir);
 
@@ -356,25 +356,49 @@ impl Host {
 
 struct Presence {
     name: String,
+    short: String,
     accepting: Arc<std::sync::atomic::AtomicBool>,
     _announcer: elo_client_core::discovery::Announcer,
 }
 
 static PRESENCE: Mutex<Option<Presence>> = Mutex::new(None);
 
+/// Número registrado no diretório (preenchido por `register_short_id`).
+static REGISTERED_SHORT: Mutex<Option<String>> = Mutex::new(None);
+
+pub(crate) fn set_registered_short(s: String) {
+    *REGISTERED_SHORT.lock().unwrap() = Some(s.clone());
+    // Se já há anúncio na LAN com outro número, recria com o registrado.
+    let mut slot = PRESENCE.lock().unwrap();
+    if let Some(p) = slot.as_ref() {
+        if p.short != s {
+            let name = p.name.clone();
+            let hosting = p.accepting.load(std::sync::atomic::Ordering::Relaxed);
+            *slot = None;
+            drop(slot);
+            presence_announce(name, s, hosting);
+        }
+    }
+}
+
+/// Número a anunciar: o registrado, quando houver; senão o derivado da chave.
+fn effective_short(kp: &Keypair) -> String {
+    REGISTERED_SHORT.lock().unwrap().clone().unwrap_or_else(|| short_id(kp))
+}
+
 /// Garante o anúncio com este nome; `hosting` define se aceita conexões.
 fn presence_announce(name: String, short_id: String, hosting: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     let mut slot = PRESENCE.lock().unwrap();
     match slot.as_ref() {
-        Some(p) if p.name == name => p.accepting.store(hosting, Ordering::Relaxed),
+        Some(p) if p.name == name && p.short == short_id => p.accepting.store(hosting, Ordering::Relaxed),
         _ => {
             // Troca de nome (ou primeiro anúncio): recria. O anterior para no drop.
             *slot = None;
             let accepting = Arc::new(AtomicBool::new(hosting));
             let announcer =
-                elo_client_core::discovery::start_with_flag(name.clone(), short_id, DIRECT_PORT, accepting.clone());
-            *slot = Some(Presence { name, accepting, _announcer: announcer });
+                elo_client_core::discovery::start_with_flag(name.clone(), short_id.clone(), DIRECT_PORT, accepting.clone());
+            *slot = Some(Presence { name, short: short_id, accepting, _announcer: announcer });
         }
     }
 }
@@ -398,7 +422,7 @@ impl Elo {
         let name: String = name.trim().chars().take(64).collect();
         let name = if name.is_empty() { "Android".to_string() } else { name };
         let hosting = presence_hosting();
-        presence_announce(name, short_id(&keypair), hosting);
+        presence_announce(name, effective_short(&keypair), hosting);
     }
 
     /// Para o anúncio, a menos que o host esteja rodando (aí ele continua).

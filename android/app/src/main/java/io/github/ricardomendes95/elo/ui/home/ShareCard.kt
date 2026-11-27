@@ -37,6 +37,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.ricardomendes95.elo.core.EloCore
+import io.github.ricardomendes95.elo.core.ShortIdState
 import io.github.ricardomendes95.elo.data.Prefs
 import io.github.ricardomendes95.elo.host.HostService
 import io.github.ricardomendes95.elo.host.HostState
@@ -50,6 +52,36 @@ import androidx.compose.runtime.setValue
 import kotlinx.coroutines.delay
 import io.github.ricardomendes95.elo.ui.PasswordField
 import io.github.ricardomendes95.elo.ui.theme.EloTheme
+
+/** "123456789" -> "123 456 789". */
+fun formatShortId(s: String): String =
+    if (s.length == 9) "${s.substring(0, 3)} ${s.substring(3, 6)} ${s.substring(6)}" else s
+
+/** Linha "ID curto" com botão copiar; mostra o cache offline, "registrando…" e erros. */
+@Composable
+fun ShortIdRow() {
+    val c = EloTheme.colors
+    val short by Prefs.shortId.collectAsState()
+    val reg by EloCore.shortReg.collectAsState()
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        Column(Modifier.weight(1f)) {
+            Text("ID curto", color = c.muted, fontSize = 12.sp)
+            when {
+                short.isNotEmpty() -> Text(
+                    formatShortId(short) + if (reg is ShortIdState.Registering) "  (atualizando…)" else "",
+                    fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
+                )
+                reg is ShortIdState.Registering -> Text("registrando…", color = c.muted, fontSize = 14.sp)
+                reg is ShortIdState.Error -> Text((reg as ShortIdState.Error).message, color = c.danger, fontSize = 13.sp)
+                else -> Text("indisponível", color = c.muted, fontSize = 14.sp)
+            }
+            if (short.isNotEmpty()) (reg as? ShortIdState.Error)?.let {
+                Text(it.message, color = c.danger, fontSize = 12.sp)
+            }
+        }
+        CopyIconButton(short.ifEmpty { null }, "ID curto", "ID curto copiado", "Copiar ID curto")
+    }
+}
 
 /** Cartão "Compartilhar esta tela": liga/desliga o host (MediaProjection + serviço). */
 @Composable
@@ -130,6 +162,9 @@ fun ShareCard() {
         )
 
         error?.let { Text(it, color = c.danger, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp)) }
+
+        Spacer(Modifier.size(8.dp))
+        ShortIdRow()
 
         Spacer(Modifier.size(10.dp))
         if (!running) {

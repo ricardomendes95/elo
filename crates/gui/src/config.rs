@@ -16,6 +16,10 @@ pub struct Favorite {
     /// true = LAN (IP), false = Internet (P2P node id / short id).
     pub lan: bool,
     pub password: String,
+    /// Último node id (endereço P2P completo) visto para este ID curto; serve
+    /// para avisar quando a identidade do aparelho muda.
+    #[serde(default)]
+    pub last_node: String,
 }
 
 /// A recently accessed computer (controller side), kept for one-click
@@ -28,6 +32,9 @@ pub struct Recent {
     pub lan: bool,
     /// Saved password (may be empty — then the user types it on reconnect).
     pub password: String,
+    /// Último node id visto para este ID curto (aviso de identidade).
+    #[serde(default)]
+    pub last_node: String,
 }
 
 /// A paired (trusted) device: connects without password or approval.
@@ -91,9 +98,14 @@ pub struct Config {
     /// UI theme: "dark" or "light".
     #[serde(default = "default_theme")]
     pub theme: String,
-    /// Optional directory server (`host:porta`) for short numeric ids.
-    #[serde(default)]
+    /// Servidor de ID curto: `https://...` (diretório HTTPS, padrão) ou
+    /// `host:porta` (relay TCP antigo). Vazio = diretório padrão.
+    #[serde(default = "default_directory")]
     pub directory: String,
+    /// Último ID curto estável recebido do diretório HTTPS (mostrado enquanto
+    /// o registro não responde ou sem internet).
+    #[serde(default)]
+    pub short_id_cache: String,
     /// This machine's stable short numeric id (9 digits), used with a directory.
     #[serde(default)]
     pub short_id: String,
@@ -114,6 +126,10 @@ pub struct Config {
 
 fn default_theme() -> String {
     "dark".to_string()
+}
+
+fn default_directory() -> String {
+    elo_client_core::shortid::DEFAULT_DIRECTORY_URL.to_string()
 }
 
 fn yes() -> bool {
@@ -199,6 +215,12 @@ impl Config {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(dir.join("config.json"), json).map_err(|e| e.to_string())
+    }
+
+    /// Diretório efetivo: o configurado, ou o padrão quando vazio.
+    pub fn directory_url(&self) -> String {
+        let d = self.directory.trim();
+        if d.is_empty() { default_directory() } else { d.to_string() }
     }
 
     pub fn is_trusted(&self, fingerprint: &str) -> bool {

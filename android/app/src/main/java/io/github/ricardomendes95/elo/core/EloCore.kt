@@ -60,6 +60,34 @@ object EloCore {
         runCatching { core().deviceId() }.mapError()
     }
 
+    /** `Settings.Secure.ANDROID_ID`: estável entre reinstalações do app (mesma chave de assinatura). */
+    @Suppress("HardwareIds")
+    private fun androidId(): String =
+        android.provider.Settings.Secure.getString(appContext.contentResolver, android.provider.Settings.Secure.ANDROID_ID) ?: ""
+
+    /** Registra o aparelho no diretório e devolve o ID curto (9 dígitos). */
+    suspend fun registerShortId(directory: String): Result<String> = withContext(Dispatchers.IO) {
+        runCatching { core().registerShortId(directory, androidId()) }.mapError()
+    }
+
+    private val _shortReg = MutableStateFlow<ShortIdState>(ShortIdState.Idle)
+    /** Estado do registro do ID curto (a UI mostra "registrando…" ou o erro). */
+    val shortReg: StateFlow<ShortIdState> = _shortReg.asStateFlow()
+
+    /** Registra (a cada abertura) e guarda o número em [io.github.ricardomendes95.elo.data.Prefs.shortId]. */
+    suspend fun refreshShortId(directory: String) {
+        if (_shortReg.value is ShortIdState.Registering) return
+        _shortReg.value = ShortIdState.Registering
+        registerShortId(directory)
+            .onSuccess { io.github.ricardomendes95.elo.data.Prefs.setShortId(it); _shortReg.value = ShortIdState.Idle }
+            .onFailure { _shortReg.value = ShortIdState.Error(it.message ?: "Não foi possível registrar o ID curto.") }
+    }
+
+    /** Resolve um ID curto para o node id (sem conectar). */
+    suspend fun resolveShortId(directory: String, short: String): Result<String> = withContext(Dispatchers.IO) {
+        runCatching { core().resolveShortId(directory, short) }.mapError()
+    }
+
     /** Liga o papel de host (bloqueante: chame em `Dispatchers.IO`). */
     fun startHost(name: String, password: String, listener: HostListener): Host =
         core().startHost(name.ifBlank { defaultDeviceName() }, password, listener)
@@ -94,7 +122,7 @@ object EloCore {
         val listener = ActiveSession.Listener()
         try {
             val s = core().connect(
-                req.target.trim(), req.lan, req.password, req.name.ifBlank { defaultDeviceName() },
+                (req.resolvedNode ?: req.target).trim(), req.lan, req.password, req.name.ifBlank { defaultDeviceName() },
                 req.totpCode, req.directory, downloadDir().absolutePath, listener,
             )
             val a = ActiveSession(s, s.info(), req.label.ifBlank { req.target.trim() }, listener) {
@@ -136,6 +164,12 @@ object EloCore {
     }
 }
 
+sealed interface ShortIdState {
+    data object Idle : ShortIdState
+    data object Registering : ShortIdState
+    data class Error(val message: String) : ShortIdState
+}
+
 data class ConnectRequest(
     /** Endereço Elo, ID curto (9 dígitos) ou IP[:porta] (com [lan]). */
     val target: String,
@@ -143,8 +177,10 @@ data class ConnectRequest(
     val password: String = "",
     val name: String = "",
     val totpCode: String? = null,
-    /** Servidor de diretório `host:porta` (para ID curto). */
+    /** Servidor de diretório: `https://...` (novo, vazio = padrão) ou `host:porta` (relay antigo). */
     val directory: String = "",
+    /** Node id já resolvido a partir de um ID curto (conecta direto por ele). */
+    val resolvedNode: String? = null,
     /** Rótulo mostrado na sessão (nome do favorito); padrão = target. */
     val label: String = "",
 )

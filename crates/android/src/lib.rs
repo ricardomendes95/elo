@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use elo_client_core::controller::{connect_on_opts, run_controller_direct_opts, ConnectOptions, ControllerEvent, ControllerHandle, DirectControllerConfig, ERR_2FA_REQUIRED};
+use elo_client_core::shortid;
 use elo_protocol::{InputEvent, MouseButton};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -148,6 +149,37 @@ impl Elo {
         Ok(self.node()?.id())
     }
 
+    /// Registra este aparelho no diretório HTTPS e devolve o ID curto (9 dígitos,
+    /// sempre o mesmo para o mesmo `android_id`). Bloqueia. `directory` vazio =
+    /// diretório padrão. Também passa a ser o número anunciado na LAN.
+    pub fn register_short_id(&self, directory: String, android_id: String) -> Result<String, EloError> {
+        let dir = effective_directory(&directory);
+        if !shortid::is_http(&dir) {
+            return Err(EloError::Failed { msg: "o registro de ID curto exige um diretório https:// (veja Configurações)".into() });
+        }
+        if android_id.trim().is_empty() {
+            return Err(EloError::Failed { msg: "ID do aparelho indisponível".into() });
+        }
+        let node_id = self.node()?.id();
+        let hash = shortid::device_hash(&android_id);
+        let short = self
+            .rt
+            .block_on(shortid::register(&dir, &hash, &node_id))
+            .map_err(|e| EloError::Failed { msg: format!("{e:#}") })?;
+        tracing::info!("ID curto registrado");
+        host::set_registered_short(short.clone());
+        Ok(short)
+    }
+
+    /// Resolve um ID curto (9 dígitos) para o endereço Elo (P2P) via diretório,
+    /// sem conectar. Um endereço completo é devolvido como veio. Bloqueia.
+    pub fn resolve_short_id(&self, directory: String, short: String) -> Result<String, EloError> {
+        let dir = effective_directory(&directory);
+        self.rt
+            .block_on(resolve_target(short.trim(), &dir))
+            .map_err(EloError::from_text)
+    }
+
     /// Conecta a um host e devolve a sessão. Bloqueia até autenticar (inclui a
     /// espera pela aprovação do dono, até ~2 min).
     ///
@@ -187,7 +219,7 @@ impl Elo {
             self.rt.block_on(run_controller_direct_opts(cfg, opts)).map_err(|e| format!("{e:#}"))
         } else {
             let node = self.node()?;
-            let directory = directory.trim().to_string();
+            let directory = effective_directory(&directory);
             self.rt.block_on(async move {
                 let node_id = resolve_target(&target, &directory).await?;
                 let duplex = tokio::time::timeout(Duration::from_secs(30), node.connect(&node_id))
@@ -217,10 +249,14 @@ impl Elo {
         let digits: String = target.chars().filter(|c| c.is_ascii_digit()).collect();
         if digits.len() == 9 && target.len() <= 11 {
             // ID curto: presença = registrado no diretório (como no desktop).
-            if directory.trim().is_empty() {
+            let dir = effective_directory(&directory);
+            if shortid::is_http(&dir) {
+                return self.rt.block_on(shortid::resolve(&dir, &digits)).is_ok();
+            }
+            if dir.is_empty() {
                 return false;
             }
-            return self.rt.block_on(elo_client_core::rendezvous::resolve_directory(directory.trim(), &digits)).is_ok();
+            return self.rt.block_on(elo_client_core::rendezvous::resolve_directory(&dir, &digits)).is_ok();
         }
         let Ok(node) = self.node() else { return false };
         self.rt.block_on(node.ping(&target, Duration::from_secs(8)))
@@ -243,10 +279,25 @@ impl Elo {
     }
 }
 
+/// Diretório de ID curto padrão (HTTPS), usado quando o campo das Configurações está vazio.
+#[uniffi::export]
+pub fn default_directory_url() -> String {
+    shortid::DEFAULT_DIRECTORY_URL.to_string()
+}
+
+/// Diretório vazio = o padrão (HTTPS).
+fn effective_directory(directory: &str) -> String {
+    let d = directory.trim();
+    if d.is_empty() { shortid::DEFAULT_DIRECTORY_URL.to_string() } else { d.to_string() }
+}
+
 /// ID curto (9 dígitos, com ou sem espaços) → endereço Elo via diretório.
 async fn resolve_target(target: &str, directory: &str) -> Result<String, String> {
     let digits: String = target.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.len() == 9 && target.len() <= 11 {
+        if shortid::is_http(directory) {
+            return shortid::resolve(directory, &digits).await.map_err(|e| format!("{e:#}"));
+        }
         if directory.is_empty() {
             return Err("Para usar o ID curto, configure o servidor de diretório em Configurações (ou cole o endereço completo).".into());
         }

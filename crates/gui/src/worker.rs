@@ -36,7 +36,18 @@ pub async fn run_headless(state_dir: PathBuf) {
     tracing::info!(node = %node.id(), "host do serviço ativo");
 
     let cfg0 = Config::load_from(&state_dir);
-    hostrun::spawn_directory(cfg0.directory.clone(), cfg0.short_id.clone(), node.id());
+    {
+        let nid = node.id();
+        let dir = state_dir.clone();
+        let on_id: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |short| {
+            let mut c = Config::load_from(&dir);
+            if c.short_id_cache != short {
+                c.short_id_cache = short.to_string();
+                c.save_to(&dir);
+            }
+        });
+        hostrun::spawn_directory(cfg0.directory_url(), cfg0.short_id.clone(), Arc::new(move || nid.clone()), None, Some(on_id));
+    }
 
     let link = WorkerLink::start(ipc::token(&state_dir));
 

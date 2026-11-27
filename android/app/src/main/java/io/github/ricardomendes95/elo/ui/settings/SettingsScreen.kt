@@ -32,6 +32,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.ricardomendes95.elo.core.EloCore
 import io.github.ricardomendes95.elo.data.Prefs
+import io.github.ricardomendes95.elo.ffi.defaultDirectoryUrl
 import io.github.ricardomendes95.elo.ui.EloCard
 import io.github.ricardomendes95.elo.ui.EloField
 import io.github.ricardomendes95.elo.ui.Feedback
@@ -62,7 +63,7 @@ fun SettingsScreen() {
             Choice("Tema", theme, listOf("dark" to "Escuro", "light" to "Claro", "system" to "Sistema")) { Prefs.setTheme(it); Feedback.show("Tema alterado") }
         }
         Section("Conexão") {
-            Item("Servidor de diretório", directory.ifBlank { "desligado (host:porta, para IDs curtos)" }, onClick = { editDir = true })
+            Item("Servidor de diretório", directory.ifBlank { defaultDirectoryUrl() }, onClick = { editDir = true })
             HorizontalDivider(color = c.border)
             Item("Porta LAN padrão", "9000 (informativa)")
         }
@@ -86,8 +87,12 @@ fun SettingsScreen() {
         Prefs.setDeviceName(it.trim().takeIf { n -> n != defaultName } ?: ""); editName = false
         Feedback.show("Nome salvo")
     }
-    if (editDir) TextDialog("Servidor de diretório (host:porta)", directory, { editDir = false }) {
-        Prefs.setDirectory(it); editDir = false
+    if (editDir) TextDialog(
+        "Servidor de diretório", directory.ifBlank { defaultDirectoryUrl() }, { editDir = false },
+        help = "Use https://... para o diretório de ID curto estável (novo) ou host:porta para o relay antigo. " +
+            "Deixe em branco para voltar ao padrão.",
+    ) {
+        Prefs.setDirectory(if (it.trim() == defaultDirectoryUrl()) "" else it); editDir = false
         Feedback.show("Servidor de diretório salvo")
     }
 }
@@ -140,11 +145,16 @@ private fun Choice(title: String, current: String, options: List<Pair<String, St
 }
 
 @Composable
-private fun TextDialog(title: String, initial: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+private fun TextDialog(title: String, initial: String, onDismiss: () -> Unit, help: String? = null, onSave: (String) -> Unit) {
     var v by remember { mutableStateOf(initial) }
     AlertDialog(
         onDismissRequest = onDismiss, title = { Text(title) },
-        text = { EloField(v, { v = it }, title) },
+        text = {
+            Column {
+                EloField(v, { v = it }, title)
+                if (help != null) Text(help, color = EloTheme.colors.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+            }
+        },
         confirmButton = { TextButton(onClick = { onSave(v) }) { Text("Salvar") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } },
     )

@@ -14,6 +14,8 @@ data class Favorite(
     val address: String,
     val lan: Boolean,
     val password: String = "",
+    /** Último node id (endereço P2P) visto para este endereço; detecta troca de identidade. */
+    val lastNode: String = "",
 )
 
 /** Um acesso recente (último conectado primeiro). */
@@ -22,6 +24,7 @@ data class Recent(
     val address: String,
     val lan: Boolean,
     val password: String = "",
+    val lastNode: String = "",
 )
 
 /** Preferências do app (SharedPreferences + JSON), expostas como StateFlows. */
@@ -59,6 +62,29 @@ object Prefs {
     /** Senha opcional para quem se conecta a este celular (vazio = pedir aprovação). */
     val hostPassword: StateFlow<String> = _hostPassword.asStateFlow()
 
+    private val _shortId = MutableStateFlow("")
+    /** Último ID curto registrado (cache para mostrar offline). */
+    val shortId: StateFlow<String> = _shortId.asStateFlow()
+
+    fun setShortId(v: String) { _shortId.value = v; sp.edit().putString("shortId", v).apply() }
+
+    /** Grava o node id visto para [address] em favoritos e recentes. */
+    fun setLastNode(address: String, lan: Boolean, node: String) {
+        val addr = address.trim()
+        if (_favorites.value.any { it.address == addr && it.lan == lan && it.lastNode != node })
+            setFavorites(_favorites.value.map { if (it.address == addr && it.lan == lan) it.copy(lastNode = node) else it })
+        if (_recents.value.any { it.address == addr && it.lan == lan && it.lastNode != node })
+            setRecents(_recents.value.map { if (it.address == addr && it.lan == lan) it.copy(lastNode = node) else it })
+    }
+
+    /** Último node id conhecido para [address] (favoritos primeiro, depois recentes). */
+    fun lastNode(address: String, lan: Boolean): String {
+        val addr = address.trim()
+        return _favorites.value.firstOrNull { it.address == addr && it.lan == lan && it.lastNode.isNotEmpty() }?.lastNode
+            ?: _recents.value.firstOrNull { it.address == addr && it.lan == lan && it.lastNode.isNotEmpty() }?.lastNode
+            ?: ""
+    }
+
     fun init(context: Context) {
         if (::sp.isInitialized) return
         sp = context.applicationContext.getSharedPreferences("elo", Context.MODE_PRIVATE)
@@ -66,6 +92,7 @@ object Prefs {
         _recents.value = parseRecents(sp.getString("recents", null))
         _deviceName.value = sp.getString("deviceName", "") ?: ""
         _directory.value = sp.getString("directory", "") ?: ""
+        _shortId.value = sp.getString("shortId", "") ?: ""
         _theme.value = sp.getString("theme", "dark") ?: "dark"
         _touchMode.value = sp.getString("touchMode", "direct") ?: "direct"
         _audioOnStart.value = sp.getBoolean("audioOnStart", true)
@@ -78,7 +105,7 @@ object Prefs {
         sp.edit().putString("favorites", JSONArray().apply {
             list.forEach {
                 put(JSONObject().put("name", it.name).put("address", it.address)
-                    .put("lan", it.lan).put("password", it.password))
+                    .put("lan", it.lan).put("password", it.password).put("lastNode", it.lastNode))
             }
         }.toString()).apply()
     }
@@ -99,7 +126,7 @@ object Prefs {
         sp.edit().putString("recents", JSONArray().apply {
             list.forEach {
                 put(JSONObject().put("name", it.name).put("address", it.address)
-                    .put("lan", it.lan).put("password", it.password))
+                    .put("lan", it.lan).put("password", it.password).put("lastNode", it.lastNode))
             }
         }.toString()).apply()
     }
@@ -123,7 +150,7 @@ object Prefs {
         }
         // Mantém a senha salva quando a reconexão não trouxe uma nova.
         val finalPassword = password.ifBlank { existing?.password ?: "" }
-        val entry = Recent(finalName, addr, lan, finalPassword)
+        val entry = Recent(finalName, addr, lan, finalPassword, existing?.lastNode ?: "")
         val list = (listOf(entry) + _recents.value.filter { !(it.address == addr && it.lan == lan) }).take(8)
         setRecents(list)
     }
@@ -140,7 +167,7 @@ object Prefs {
         val a = JSONArray(s ?: return emptyList())
         (0 until a.length()).map {
             val o = a.getJSONObject(it)
-            Favorite(o.getString("name"), o.getString("address"), o.optBoolean("lan"), o.optString("password"))
+            Favorite(o.getString("name"), o.getString("address"), o.optBoolean("lan"), o.optString("password"), o.optString("lastNode"))
         }
     }.getOrDefault(emptyList())
 
@@ -151,7 +178,7 @@ object Prefs {
             when (val v = a.get(i)) {
                 is JSONObject -> Recent(
                     v.optString("name").ifBlank { v.getString("address") },
-                    v.getString("address"), v.optBoolean("lan"), v.optString("password"),
+                    v.getString("address"), v.optBoolean("lan"), v.optString("password"), v.optString("lastNode"),
                 )
                 else -> {
                     val addr = v.toString()

@@ -204,8 +204,28 @@ fn page_home(app: &mut App, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             section_title(ui, &pal, if app.service_mode { "Este computador (serviço do Windows)" } else { "Este computador" });
             ui.add_space(6.0);
-            let has_dir = !app.config.directory.trim().is_empty();
-            if has_dir {
+            let st = app.short_state.lock().unwrap().clone();
+            let http = elo_client_core::shortid::is_http(&app.config.directory_url());
+            if http && app.my_short_id.len() != 9 {
+                let (msg, col) = match &st.error {
+                    Some(e) => (e.clone(), pal.muted),
+                    None => ("registrando ID curto…".to_string(), pal.muted),
+                };
+                ui.label(egui::RichText::new(msg).color(col));
+                ui.add_space(6.0);
+            } else if http {
+                ui.label(egui::RichText::new(format_id(&app.my_short_id)).size(40.0).strong().monospace().color(pal.accent_text));
+                let id = app.my_short_id.clone();
+                app.copy_button(ui, "my-id", "Copiar ID", &id, "ID copiado", false).on_hover_text("Copia o ID de 9 dígitos deste computador (o mesmo, mesmo após reinstalar o Elo)");
+                ui.add_space(6.0);
+                if let Some(e) = &st.error {
+                    ui.label(egui::RichText::new(format!("{e} (mostrando o último número conhecido)")).small().color(pal.muted));
+                } else if st.registering {
+                    ui.label(egui::RichText::new("atualizando registro…").small().color(pal.muted));
+                } else {
+                    ui.label(egui::RichText::new("endereço completo").small().color(pal.muted));
+                }
+            } else if !app.config.directory.trim().is_empty() {
                 ui.label(egui::RichText::new(format_id(&app.my_short_id)).size(40.0).strong().monospace().color(pal.accent_text));
                 let id = app.my_short_id.clone();
                 app.copy_button(ui, "my-id", "Copiar ID", &id, "ID copiado", false).on_hover_text("Copia o ID de 9 dígitos deste computador");

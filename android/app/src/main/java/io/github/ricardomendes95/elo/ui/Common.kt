@@ -112,6 +112,13 @@ fun ConnectDialogs(full: Boolean) {
     val state by Connector.state.collectAsState()
     when (val s = state) {
         ConnState.NeedTwoFa -> TwoFaDialog()
+        ConnState.IdentityChanged -> AlertDialog(
+            onDismissRequest = { Connector.cancel() },
+            title = { Text("Identidade alterada") },
+            text = { Text("A identidade deste aparelho mudou (reinstalação?). Conectar mesmo assim?") },
+            confirmButton = { TextButton(onClick = { Connector.confirmIdentity() }) { Text("Conectar") } },
+            dismissButton = { TextButton(onClick = { Connector.cancel() }) { Text("Cancelar") } },
+        )
         is ConnState.Connecting -> if (full) {
             AlertDialog(
                 onDismissRequest = {},

@@ -68,13 +68,116 @@ pub fn load_or_create_keypair(dir: &Path) -> Keypair {
     kp
 }
 
-/// Keep `short_id -> node_id` registered in a directory server (reconnects).
-pub fn spawn_directory(directory: String, short_id: String, node_id: String) {
+/// Estado do registro do ID curto (diretório HTTPS), lido pela UI.
+#[derive(Default, Clone)]
+pub struct ShortState {
+    /// Último número de 9 dígitos devolvido pelo servidor.
+    pub id: Option<String>,
+    pub registering: bool,
+    /// Último erro do registro (amigável), se o último ciclo falhou.
+    pub error: Option<String>,
+    /// Sobe a cada erro novo (diferente do anterior), para a UI dar um toast só uma vez.
+    pub err_seq: u64,
+}
+
+pub type SharedShort = Arc<Mutex<ShortState>>;
+
+/// Re-registro periódico do ID curto no diretório HTTPS.
+const REREGISTER: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Mensagem amigável (pt-BR) para uma falha do diretório de ID curto.
+pub fn friendly_directory_error(e: &str) -> String {
+    let l = e.to_lowercase();
+    if l.contains("não encontrado") || l.contains("not found") {
+        "ID não encontrado: confira o número ou veja se o outro computador já abriu o Elo.".into()
+    } else if l.contains("sem resposta") || l.contains("timed out") || l.contains("dns") || l.contains("connect") {
+        "Servidor de ID curto fora do ar ou sem internet. Tente de novo em instantes.".into()
+    } else if l.contains("9 dígitos") {
+        "O ID curto tem 9 dígitos.".into()
+    } else {
+        format!("Servidor de ID curto: {e}")
+    }
+}
+
+/// Mantém o ID curto registrado. Diretório HTTPS: registra com o hash do
+/// MachineGuid (número estável, mesmo após reinstalar), repete a cada ~6 h e
+/// quando `node_id()` muda; `on_id` recebe o número. Relay TCP (`host:porta`):
+/// comportamento antigo com `short_id` aleatório.
+pub fn spawn_directory(
+    directory: String,
+    short_id: String,
+    node_id: Arc<dyn Fn() -> String + Send + Sync>,
+    state: Option<SharedShort>,
+    on_id: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+) {
+    use elo_client_core::shortid;
+    if shortid::is_http(&directory) {
+        let set_err = move |state: &Option<SharedShort>, msg: String| {
+            if let Some(st) = state {
+                let mut g = st.lock().unwrap();
+                g.registering = false;
+                if g.error.as_deref() != Some(msg.as_str()) {
+                    g.err_seq += 1;
+                }
+                g.error = Some(msg);
+            }
+        };
+        #[cfg(windows)]
+        let guid = shortid::windows_machine_guid();
+        #[cfg(not(windows))]
+        let guid: Option<String> = None;
+        let Some(guid) = guid else {
+            tracing::warn!("MachineGuid indisponível; ID curto estável desativado");
+            set_err(&state, "Não consegui ler o identificador do Windows para o ID curto estável.".into());
+            return;
+        };
+        let hash = shortid::device_hash(&guid);
+        tokio::spawn(async move {
+            let mut last_node = String::new();
+            let mut last_ok: Option<std::time::Instant> = None;
+            let mut retry_at = std::time::Instant::now();
+            loop {
+                let node = node_id();
+                let valid = node.len() > 16 && node.chars().all(|c| c.is_ascii_alphanumeric());
+                let due = last_ok.map_or(true, |t| t.elapsed() >= REREGISTER)
+                    || node != last_node;
+                if valid && due && std::time::Instant::now() >= retry_at {
+                    if let Some(st) = &state {
+                        st.lock().unwrap().registering = true;
+                    }
+                    match shortid::register(&directory, &hash, &node).await {
+                        Ok(short) => {
+                            tracing::info!(%directory, "ID curto {short} registrado");
+                            if let Some(st) = &state {
+                                let mut g = st.lock().unwrap();
+                                g.registering = false;
+                                g.error = None;
+                                g.id = Some(short.clone());
+                            }
+                            if let Some(f) = &on_id {
+                                f(&short);
+                            }
+                            last_ok = Some(std::time::Instant::now());
+                            last_node = node;
+                        }
+                        Err(e) => {
+                            tracing::warn!(%directory, error = %format!("{e:#}"), "registro do ID curto falhou");
+                            set_err(&state, friendly_directory_error(&format!("{e:#}")));
+                            retry_at = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            }
+        });
+        return;
+    }
     if directory.trim().is_empty() || short_id.len() != 9 {
         return;
     }
     tokio::spawn(async move {
         loop {
+            let node_id = node_id();
             match elo_client_core::rendezvous::register_directory(&directory, &short_id, &node_id).await {
                 Ok(mut conn) => {
                     tracing::info!(%directory, "registrado no diretório como {short_id}");

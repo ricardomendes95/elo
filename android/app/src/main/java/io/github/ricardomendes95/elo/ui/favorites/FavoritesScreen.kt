@@ -135,7 +135,7 @@ fun FavoritesScreen() {
     }
     editing?.let { old ->
         FavoriteDialog(old, onDismiss = { editing = null }) { nw ->
-            Prefs.setFavorites(Prefs.favorites.value.map { if (it == old) nw else it }); editing = null
+            Prefs.setFavorites(Prefs.favorites.value.map { if (it == old) nw.copy(lastNode = if (nw.address == old.address && nw.lan == old.lan) old.lastNode else "") else it }); editing = null
             Feedback.show("Favorito atualizado")
         }
     }

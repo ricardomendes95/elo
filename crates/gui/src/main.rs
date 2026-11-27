@@ -272,6 +272,9 @@ pub fn short_fp(fp: &str) -> String {
 }
 
 /// Human-friendly connection errors.
+/// Prefixo do erro interno que pede confirmação quando o node id de um ID curto mudou.
+const ERR_IDENTITY_CHANGED: &str = "identity-changed:";
+
 fn friendly_error(e: &str) -> String {
     let l = e.to_lowercase();
     if l.contains("invalid node id") {
@@ -370,6 +373,15 @@ pub struct App {
     pub my_lan: String,
     pub my_node: Arc<Mutex<String>>,
     pub my_short_id: String,
+    /// Estado do registro do ID curto estável (diretório HTTPS).
+    pub short_state: hostrun::SharedShort,
+    short_err_seen: u64,
+    /// Aviso de identidade: node id novo aguardando confirmação do usuário.
+    pub identity_prompt: Option<String>,
+    /// Node id que o usuário já aceitou conectar (pula o aviso uma vez).
+    identity_accept: Option<String>,
+    /// Node id resolvido pelo diretório na tentativa de conexão em curso.
+    resolved_node: Arc<Mutex<Option<String>>>,
     pub session_password: Arc<Mutex<String>>,
     pub host_status: Arc<Mutex<String>>,
     pub host_started: bool,
@@ -463,14 +475,21 @@ impl App {
         #[cfg(not(windows))]
         let service_mode = false;
 
+        let http_dir = elo_client_core::shortid::is_http(&config.directory_url());
         let (my_node, my_short_id) = if service_mode {
             let sdir = config::service_dir();
             let id = elo_p2p::id_from_secret_file(&sdir.join("node.key")).unwrap_or_else(|| "—".into());
             let sc = Config::load_from(&sdir);
-            let short = if sc.short_id.len() == 9 { sc.short_id } else { config.short_id.clone() };
+            let short = if http_dir {
+                if sc.short_id_cache.len() == 9 { sc.short_id_cache } else { config.short_id_cache.clone() }
+            } else if sc.short_id.len() == 9 {
+                sc.short_id
+            } else {
+                config.short_id.clone()
+            };
             (id, short)
         } else {
-            ("iniciando…".to_string(), config.short_id.clone())
+            ("iniciando…".to_string(), if http_dir { config.short_id_cache.clone() } else { config.short_id.clone() })
         };
         let (ui_tx, ui_rx) = smpsc::channel();
         let (bg_tx, bg_rx) = smpsc::channel();
@@ -500,6 +519,11 @@ impl App {
             my_lan: local_ip(),
             my_node: Arc::new(Mutex::new(my_node)),
             my_short_id,
+            short_state: Arc::new(Mutex::new(hostrun::ShortState::default())),
+            short_err_seen: 0,
+            identity_prompt: None,
+            identity_accept: None,
+            resolved_node: Arc::new(Mutex::new(None)),
             session_password: Arc::new(Mutex::new(random_code())),
             host_status: Arc::new(Mutex::new("iniciando…".into())),
             host_started: false,
@@ -692,7 +716,7 @@ impl App {
 
         // LAN discovery: listen for other devices and announce ourselves while
         // we host. Needs the tokio runtime context.
-        let disp = if self.config.display_name.trim().is_empty() { config::computer_name() } else { self.config.display_name.clone() };
+        let disp = self.display_name();
         {
             let _g = self.rt.enter();
             match elo_client_core::discovery::listen() {
@@ -708,6 +732,18 @@ impl App {
         if self.service_mode {
             *status.lock().unwrap() = "online — serviço do Windows (funciona com a tela bloqueada)".into();
             ipc::spawn_gui_server(&self.rt, config::service_dir(), self.ui_tx.clone());
+            {
+                // O serviço também registra (idempotente); a GUI registra para exibir o número.
+                let _g = self.rt.enter();
+                let my_node = self.my_node.clone();
+                hostrun::spawn_directory(
+                    self.config.directory_url(),
+                    self.config.short_id.clone(),
+                    Arc::new(move || my_node.lock().unwrap().clone()),
+                    Some(self.short_state.clone()),
+                    None,
+                );
+            }
             self.rt.spawn(async move {
                 match elo_p2p::bind_node_ephemeral().await {
                     Ok(n) => *node_slot.lock().unwrap() = Some(n),
@@ -722,8 +758,9 @@ impl App {
             let ui_tx = self.ui_tx.clone();
             let link_out = self.host_link.clone();
             let online = format!("online — LAN {}:{DIRECT_PORT} · Internet pronto", self.my_lan);
-            let directory = self.config.directory.clone();
-            let short = self.my_short_id.clone();
+            let directory = self.config.directory_url();
+            let short = self.config.short_id.clone();
+            let short_state = self.short_state.clone();
             self.rt.spawn(async move {
                 let node = match elo_p2p::bind_node(&config::config_dir().join("node.key")).await {
                     Ok(n) => n,
@@ -735,7 +772,8 @@ impl App {
                 };
                 *my_node.lock().unwrap() = node.id();
                 *node_slot.lock().unwrap() = Some(node.clone());
-                hostrun::spawn_directory(directory, short, node.id());
+                let nid = node.id();
+                hostrun::spawn_directory(directory, short, Arc::new(move || nid.clone()), Some(short_state), None);
 
                 let live2 = live.clone();
                 let pw2 = pw.clone();
@@ -780,6 +818,35 @@ impl App {
         self.spawn_presence();
     }
 
+    fn display_name(&self) -> String {
+        if self.config.display_name.trim().is_empty() { config::computer_name() } else { self.config.display_name.clone() }
+    }
+
+    /// Traz para a UI o número vindo do diretório e avisa (uma vez) sobre erros.
+    fn sync_short_id(&mut self) {
+        let st = self.short_state.lock().unwrap().clone();
+        if let Some(id) = st.id {
+            if id != self.my_short_id {
+                self.my_short_id = id.clone();
+                let _g = self.rt.enter();
+                self.announcer = None;
+                self.announcer = Some(elo_client_core::discovery::start(self.display_name(), id.clone(), DIRECT_PORT));
+            }
+            if self.config.short_id_cache != id {
+                let mut cfg = self.config.clone();
+                cfg.short_id_cache = id;
+                self.draft.short_id_cache = cfg.short_id_cache.clone();
+                self.save_config(cfg);
+            }
+        }
+        if st.err_seq != self.short_err_seen {
+            self.short_err_seen = st.err_seq;
+            if let Some(e) = st.error {
+                self.toast_error(e);
+            }
+        }
+    }
+
     /// Check every ~45 s which favorites are online.
     fn spawn_presence(&self) {
         let live = self.live.clone();
@@ -797,7 +864,7 @@ impl App {
                             t.push((r.address.clone(), r.lan));
                         }
                     }
-                    (t, c.directory.clone())
+                    (t, c.directory_url())
                 };
                 let n = node.lock().unwrap().clone();
                 for (address, lan) in targets {
@@ -807,7 +874,17 @@ impl App {
                     } else {
                         let digits: String = address.chars().filter(|c| c.is_ascii_digit()).collect();
                         if digits.len() == 9 && !dir.trim().is_empty() {
-                            elo_client_core::rendezvous::resolve_directory(&dir, &digits).await.is_ok()
+                            if elo_client_core::shortid::is_http(&dir) {
+                                match elo_client_core::shortid::resolve(&dir, &digits).await {
+                                    Ok(node_id) => match &n {
+                                        Some(n) => n.ping(&node_id, Duration::from_secs(8)).await,
+                                        None => true,
+                                    },
+                                    Err(_) => false,
+                                }
+                            } else {
+                                elo_client_core::rendezvous::resolve_directory(&dir, &digits).await.is_ok()
+                            }
                         } else if let Some(n) = &n {
                             n.ping(&address, Duration::from_secs(8)).await
                         } else {
@@ -854,15 +931,38 @@ impl App {
                 self.conn = Conn::Failed("P2P ainda iniciando — tente em instantes.".into());
                 return;
             };
-            let directory = self.config.directory.trim().to_string();
+            let directory = self.config.directory_url();
+            *self.resolved_node.lock().unwrap() = None;
+            let resolved_slot = self.resolved_node.clone();
+            // Último node id visto para este ID curto (favoritos/recentes) e
+            // eventual confirmação do usuário para a identidade nova.
+            let known_node = {
+                let t = target.trim();
+                self.config
+                    .favorites
+                    .iter()
+                    .map(|f| (&f.address, &f.last_node))
+                    .chain(self.config.recents.iter().map(|r| (&r.address, &r.last_node)))
+                    .find(|(a, n)| a.trim() == t && !n.is_empty())
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_default()
+            };
+            let accepted = self.identity_accept.clone();
             let task = self.rt.spawn(async move {
                 let res = async {
                     let digits: String = target.chars().filter(|c| c.is_ascii_digit()).collect();
                     let node_id = if digits.len() == 9 && target.len() <= 11 {
-                        if directory.is_empty() {
-                            return Err("Para usar o ID curto, configure o servidor de diretório em Configurações → Conexão (ou cole o endereço completo).".to_string());
+                        let r = if elo_client_core::shortid::is_http(&directory) {
+                            elo_client_core::shortid::resolve(&directory, &digits).await
+                        } else {
+                            elo_client_core::rendezvous::resolve_directory(&directory, &digits).await
+                        };
+                        let nid = r.map_err(|e| hostrun::friendly_directory_error(&format!("{e:#}")))?;
+                        *resolved_slot.lock().unwrap() = Some(nid.clone());
+                        if !known_node.is_empty() && known_node != nid && accepted.as_deref() != Some(nid.as_str()) {
+                            return Err(format!("{ERR_IDENTITY_CHANGED}{nid}"));
                         }
-                        elo_client_core::rendezvous::resolve_directory(&directory, &digits).await.map_err(|e| format!("{e:#}"))?
+                        nid
                     } else {
                         target.clone()
                     };
@@ -904,7 +1004,7 @@ impl App {
     /// Upsert a recent on a successful controller connection: dedup by address,
     /// newest first, capped at 10. Keeps an existing (possibly renamed) name,
     /// else the matching favorite's name, else the address itself.
-    fn record_recent(&mut self, address: &str, lan: bool, password: String) {
+    fn record_recent(&mut self, address: &str, lan: bool, password: String, node: Option<String>) {
         let addr = address.trim().to_string();
         if addr.is_empty() {
             return;
@@ -918,8 +1018,22 @@ impl App {
             .or_else(|| cfg.favorites.iter().find(|f| f.address == addr).map(|f| f.name.clone()))
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| addr.clone());
+        let prev_node = cfg
+            .recents
+            .iter()
+            .find(|r| r.address == addr)
+            .map(|r| r.last_node.clone())
+            .or_else(|| cfg.favorites.iter().find(|f| f.address == addr).map(|f| f.last_node.clone()))
+            .unwrap_or_default();
+        let last_node = node.clone().unwrap_or(prev_node);
+        if let Some(n) = &node {
+            for f in cfg.favorites.iter_mut().filter(|f| f.address == addr) {
+                f.last_node = n.clone();
+            }
+            self.draft.favorites = cfg.favorites.clone();
+        }
         cfg.recents.retain(|r| r.address != addr);
-        cfg.recents.insert(0, config::Recent { name, address: addr, lan, password });
+        cfg.recents.insert(0, config::Recent { name, address: addr, lan, password, last_node });
         cfg.recents.truncate(10);
         self.draft.recents = cfg.recents.clone();
         self.save_config(cfg);
@@ -933,7 +1047,7 @@ impl App {
             return false;
         }
         let mut cfg = self.config.clone();
-        cfg.favorites.push(config::Favorite { name, address: addr, lan, password });
+        cfg.favorites.push(config::Favorite { name, address: addr, lan, password, last_node: String::new() });
         self.draft.favorites = cfg.favorites.clone();
         self.save_config(cfg);
         true
@@ -948,7 +1062,7 @@ impl App {
         let name = if self.fav_name.trim().is_empty() { addr.chars().take(18).collect() } else { self.fav_name.trim().to_string() };
         let mut cfg = self.config.clone();
         cfg.favorites.retain(|f| f.address != addr);
-        cfg.favorites.push(config::Favorite { name, address: addr, lan: self.mode_lan, password: self.remote_password.clone() });
+        cfg.favorites.push(config::Favorite { name, address: addr, lan: self.mode_lan, password: self.remote_password.clone(), last_node: String::new() });
         self.draft.favorites = cfg.favorites.clone();
         self.save_config(cfg);
         self.fav_name.clear();
@@ -1004,12 +1118,18 @@ impl App {
             Ok((handle, events, label)) => {
                 tracing::info!(target = %label, "sessão de controle iniciada");
                 self.toast(format!("Conectado a {label}."));
-                self.record_recent(&label, self.mode_lan, self.remote_password.clone());
+                self.identity_accept = None;
+                let node = self.resolved_node.lock().unwrap().take();
+                self.record_recent(&label, self.mode_lan, self.remote_password.clone(), node);
                 Conn::Active(Box::new(Session::new(handle, events, label)))
             }
             Err(e) if e.contains(ERR_2FA_REQUIRED) => {
                 self.need_2fa = true;
                 self.twofa_code.clear();
+                Conn::Idle
+            }
+            Err(e) if e.starts_with(ERR_IDENTITY_CHANGED) => {
+                self.identity_prompt = Some(e[ERR_IDENTITY_CHANGED.len()..].to_string());
                 Conn::Idle
             }
             Err(e) => {
@@ -1067,6 +1187,38 @@ impl App {
             if let Some(r) = req.reply.take() {
                 let _ = r.send(allow);
             }
+        }
+    }
+
+    fn identity_modal(&mut self, ctx: &egui::Context) {
+        let Some(new_node) = self.identity_prompt.clone() else { return };
+        let pal = self.pal;
+        let mut decision: Option<bool> = None;
+        modal(ctx, &pal, "identity", |ui| {
+            ui.label(egui::RichText::new("Identidade alterada").size(18.0).strong().color(pal.text));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("A identidade deste aparelho mudou (reinstalação?). Conectar mesmo assim?").color(pal.muted));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(format!("Novo endereço: {}", short_fp(&new_node))).monospace().small().color(pal.muted));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new("Cancelar").min_size(egui::vec2(100.0, 34.0))).clicked() {
+                    decision = Some(false);
+                }
+                if theme::primary_button(ui, &pal, "  Conectar  ").clicked() {
+                    decision = Some(true);
+                }
+            });
+        });
+        match decision {
+            Some(true) => {
+                self.identity_prompt = None;
+                self.identity_accept = Some(new_node);
+                let code = self.need_2fa.then(|| self.twofa_code.clone());
+                self.start_connect(code);
+            }
+            Some(false) => self.identity_prompt = None,
+            None => {}
         }
     }
 
@@ -1356,6 +1508,7 @@ impl eframe::App for App {
         self.pump_events();
         self.poll_connect();
         self.poll_bg();
+        self.sync_short_id();
         self.drain_tray(ctx);
         self.handle_close(ctx);
 
@@ -1367,6 +1520,7 @@ impl eframe::App for App {
         self.host_chat_window(ctx);
         self.pointer_overlay(ctx);
         self.approval_modal(ctx);
+        self.identity_modal(ctx);
         self.twofa_modal(ctx);
         self.defender_modal(ctx);
         self.toasts_ui(ctx);

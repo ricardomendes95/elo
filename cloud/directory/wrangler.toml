@@ -1,0 +1,10 @@
+# Diretório de ID curto do Elo (Cloudflare Workers + KV, plano gratuito).
+# Deploy: `npx wrangler deploy` (depois de `npx wrangler login`).
+name = "elo-directory"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+
+# Namespace KV criado com `npx wrangler kv namespace create DIR`.
+[[kv_namespaces]]
+binding = "DIR"
+id = "2eb68e22d20943d6af096fdb3be88140"

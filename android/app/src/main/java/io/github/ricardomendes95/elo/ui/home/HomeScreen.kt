@@ -66,6 +66,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import io.github.ricardomendes95.elo.core.EloCore
+import io.github.ricardomendes95.elo.core.ShortIdState
 import io.github.ricardomendes95.elo.data.Favorite
 import io.github.ricardomendes95.elo.data.Prefs
 import io.github.ricardomendes95.elo.data.Recent
@@ -422,6 +423,12 @@ private fun DeviceCard() {
     var err by remember { mutableStateOf<String?>(null) }
     var copied by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val dirPref by Prefs.directory.collectAsState()
+    LaunchedEffect(dirPref) {
+        // Registra a cada abertura (o servidor devolve sempre o mesmo número).
+        EloCore.refreshShortId(dirPref)
+        (EloCore.shortReg.value as? ShortIdState.Error)?.let { Feedback.error("Elo", it.message) }
+    }
     LaunchedEffect(Unit) {
         EloCore.deviceId().onSuccess { id = it }.onFailure {
             android.util.Log.w("Elo", "Falha ao obter o ID P2P", it)
@@ -445,6 +452,8 @@ private fun DeviceCard() {
             color = c.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp),
         )
         Spacer(Modifier.size(12.dp))
+        ShortIdRow()
+        Spacer(Modifier.size(8.dp))
         val shown = id?.let { if (it.length > 30) it.take(14) + "…" + it.takeLast(14) else it }
         Text(
             shown ?: err ?: "iniciando P2P…",

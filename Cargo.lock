@@ -1699,12 +1699,15 @@ dependencies = [
  "if-addrs",
  "openh264",
  "rand 0.8.8",
+ "reqwest",
+ "rustls",
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "webpki-roots",
  "windows 0.58.0",
 ]
 
